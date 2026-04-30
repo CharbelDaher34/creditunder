@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  body { font-family: Arial, sans-serif; font-size: 11pt; color: #1a1a1a; margin: 40px; }
+  h1 { font-size: 16pt; color: #003366; border-bottom: 2px solid #003366; padding-bottom: 6px; }
+  h2 { font-size: 13pt; color: #003366; margin-top: 24px; border-bottom: 1px solid #cccccc; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 10pt; }
+  th { background: #003366; color: white; padding: 6px 10px; text-align: left; }
+  td { padding: 5px 10px; border-bottom: 1px solid #e0e0e0; }
+  tr:nth-child(even) { background: #f7f9fc; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 4px; font-weight: bold; font-size: 10pt; }
+  .APPROVE { background: #d4edda; color: #155724; }
+  .HOLD { background: #fff3cd; color: #856404; }
+  .DECLINE { background: #f8d7da; color: #721c24; }
+  .HARD_BREACH { background: #f8d7da; color: #721c24; }
+  .SOFT_MISMATCH { background: #fff3cd; color: #856404; }
+  .LOW_CONFIDENCE { background: #d1ecf1; color: #0c5460; }
+  .MANUAL_REVIEW_REQUIRED { background: #e2e3e5; color: #383d41; }
+  .PASSED { background: #d4edda; color: #155724; }
+  .header-meta { color: #666; font-size: 10pt; margin-bottom: 20px; }
+  .narrative { background: #f7f9fc; padding: 16px; border-left: 4px solid #003366; margin-top: 10px; line-height: 1.6; }
+  .confidence-low { color: #856404; }
+  .confidence-ok { color: #155724; }
+</style>
+</head>
+<body>
+
+<h1>Credit Underwriting Report — {{ application_id }}</h1>
+<div class="header-meta">
+  Generated: {{ generated_at }} &nbsp;|&nbsp;
+  Product: {{ product_type }} &nbsp;|&nbsp;
+  Branch: {{ branch_name }} &nbsp;|&nbsp;
+  Validator: {{ validator_id }}
+</div>
+
+<h2>Recommendation</h2>
+<p>
+  <span class="badge {{ recommendation }}">{{ recommendation }}</span>
+  &nbsp; {{ recommendation_rationale }}
+</p>
+
+<h2>Applicant Data</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  {% for k, v in applicant_data.items() %}
+  <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+  {% endfor %}
+</table>
+
+<h2>Document Verification & Extraction</h2>
+{% for doc in document_results %}
+<h3 style="margin-top:16px; font-size:11pt;">{{ doc.document_type }} — {{ doc.document_name }} ({{ doc.document_id }})</h3>
+<p>
+  Verification:
+  {% if doc.verification_passed %}
+    <span class="badge APPROVE">PASSED</span>
+  {% else %}
+    <span class="badge DECLINE">FAILED</span>
+  {% endif %}
+  &nbsp; Confidence: {{ "%.0f"|format(doc.verification_confidence * 100) }}%
+</p>
+<table>
+  <tr><th>Field</th><th>Value</th><th>Confidence</th><th>Page</th></tr>
+  {% for label, ef in doc.extracted_data.items() %}
+  <tr>
+    <td>{{ ef.normalized_label }}</td>
+    <td>{{ ef.value }}</td>
+    <td class="{% if ef.confidence < 0.7 %}confidence-low{% else %}confidence-ok{% endif %}">
+      {{ "%.0f"|format(ef.confidence * 100) }}%
+    </td>
+    <td>{{ ef.page_reference }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+
+<h2>Validation Results</h2>
+<table>
+  <tr><th>Rule</th><th>Outcome</th><th>Description</th><th>Field</th><th>Extracted</th><th>Expected</th></tr>
+  {% for r in validation_results %}
+  <tr>
+    <td>{{ r.rule_code }}</td>
+    <td><span class="badge {{ r.outcome }}">{{ r.outcome }}</span></td>
+    <td>{{ r.description }}</td>
+    <td>{{ r.field_name or '' }}</td>
+    <td>{{ r.extracted_value or '' }}</td>
+    <td>{{ r.expected_value or '' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>Analyst Narrative</h2>
+<div class="narrative">{{ narrative }}</div>
+
+</body>
+</html>
