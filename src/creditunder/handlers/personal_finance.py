@@ -109,6 +109,7 @@ class PersonalFinanceHandler(BaseProductHandler):
                         outcome=ValidationOutcome.MANUAL_REVIEW_REQUIRED,
                         description="Could not parse ID expiry date. Manual review required.",
                         field_name="expiry_date",
+                        manual_review_required=True,
                     )
                 )
 
@@ -164,6 +165,7 @@ class PersonalFinanceHandler(BaseProductHandler):
                         outcome=ValidationOutcome.MANUAL_REVIEW_REQUIRED,
                         description="Could not parse salary amount. Manual review required.",
                         field_name="total_salary",
+                        manual_review_required=True,
                     )
                 )
 

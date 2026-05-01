@@ -1,11 +1,13 @@
-.PHONY: help install infra infra-down db-migrate db-new-migration processor publish-events publish-event-0 publish-event-1 dms edw test lint format clean
+.PHONY: help install infra infra-bg infra-down infra-logs db-migrate db-new-migration processor publish-events publish-event-0 publish-event-1 dms edw test lint format clean
 
 help:
 	@echo "AI Credit Underwriting Platform — Make targets:"
 	@echo ""
 	@echo "Infrastructure:"
-	@echo "  make infra              Start postgres, redpanda, DMS, EDW (docker-compose up)"
+	@echo "  make infra              Build & start everything in Docker (infra + migrations + processor)"
+	@echo "  make infra-bg           Same but detached (background)"
 	@echo "  make infra-down         Stop all services (docker-compose down)"
+	@echo "  make infra-logs         Tail docker-compose logs"
 	@echo ""
 	@echo "Setup:"
 	@echo "  make install            Install dependencies (uv sync)"
@@ -34,16 +36,15 @@ help:
 	@echo "  make clean-db           Reset database (drop and recreate schema)"
 	@echo ""
 	@echo "Quick start:"
-	@echo "  make install"
-	@echo "  make infra               # terminal 1"
-	@echo "  make db-migrate          # terminal 2"
-	@echo "  make processor           # terminal 3"
-	@echo "  make publish-events      # terminal 2 (or any)"
+	@echo "  make infra               # starts everything: postgres, kafka, dms, edw, processor"
 
 # ---- Infrastructure ----
 
 infra:
-	docker-compose up
+	docker-compose up --build
+
+infra-bg:
+	docker-compose up --build -d
 
 infra-down:
 	docker-compose down

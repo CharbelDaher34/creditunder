@@ -50,6 +50,8 @@ class BaseProductHandler(ABC):
                         ),
                         field_name=label,
                         extracted_value=ef.value,
+                        confidence=ef.confidence,
+                        manual_review_required=True,
                     )
                 )
         return results

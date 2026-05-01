@@ -1,32 +1,62 @@
 """
 DMS (Document Management System) mockup.
-Stores documents in-memory. Pre-seeded with sample documents on startup.
+Persists documents to /data on disk. Pre-seeded with sample documents on startup.
 """
 
 import base64
+import json
+import mimetypes
 import uuid
-from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 app = FastAPI(title="DMS Mockup", version="1.0")
 
+DATA_DIR = Path("/data")
+META_DIR = DATA_DIR / "meta"
+FILES_DIR = DATA_DIR / "files"
 
-@dataclass
-class StoredDocument:
-    document_id: str
-    document_name: str
-    document_type: str
-    content: bytes
-    content_type: str
-    related_application_id: str | None = None
-    metadata: dict = field(default_factory=dict)
+for _d in (DATA_DIR, META_DIR, FILES_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
 
 
-# In-memory store
-_store: dict[str, StoredDocument] = {}
+# ---- persistence helpers ----
+
+def _meta_path(document_id: str) -> Path:
+    return META_DIR / f"{document_id}.json"
+
+
+def _save(document_id: str, document_name: str, document_type: str,
+          content: bytes, content_type: str,
+          related_application_id: str | None = None) -> None:
+    ext = mimetypes.guess_extension(content_type) or ""
+    ext = {".jpe": ".jpg", ".jpeg": ".jpg"}.get(ext, ext)
+    file_name = f"{document_id}{ext}"
+    (FILES_DIR / file_name).write_bytes(content)
+    _meta_path(document_id).write_text(json.dumps({
+        "document_id": document_id,
+        "document_name": document_name,
+        "document_type": document_type,
+        "content_type": content_type,
+        "file": file_name,
+        "related_application_id": related_application_id,
+    }))
+
+
+def _load_meta(document_id: str) -> dict | None:
+    p = _meta_path(document_id)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def _load_content(meta: dict) -> bytes:
+    return (FILES_DIR / meta["file"]).read_bytes()
+
+
+def _all_meta() -> list[dict]:
+    return [json.loads(p.read_text()) for p in META_DIR.glob("*.json")]
 
 
 # ---- sample documents seeded at startup ----
@@ -77,25 +107,15 @@ Saudi Aramco HR Department
 """.strip()
 
 
-def _seed() -> tuple[str, str]:
-    id_doc_id = "DMS-00192"
-    sal_doc_id = "DMS-00193"
-
-    _store[id_doc_id] = StoredDocument(
-        document_id=id_doc_id,
-        document_name="national_id_al_harbi.txt",
-        document_type="ID_DOCUMENT",
-        content=SAMPLE_ID_DOCUMENT.encode(),
-        content_type="text/plain",
-    )
-    _store[sal_doc_id] = StoredDocument(
-        document_id=sal_doc_id,
-        document_name="salary_certificate_al_harbi.txt",
-        document_type="SALARY_CERTIFICATE",
-        content=SAMPLE_SALARY_CERTIFICATE.encode(),
-        content_type="text/plain",
-    )
-    return id_doc_id, sal_doc_id
+def _seed() -> None:
+    for doc_id, name, doc_type, content, ct in [
+        ("DMS-00192", "national_id_al_harbi.txt", "ID_DOCUMENT",
+         SAMPLE_ID_DOCUMENT.encode(), "text/plain"),
+        ("DMS-00193", "salary_certificate_al_harbi.txt", "SALARY_CERTIFICATE",
+         SAMPLE_SALARY_CERTIFICATE.encode(), "text/plain"),
+    ]:
+        if not _meta_path(doc_id).exists():
+            _save(doc_id, name, doc_type, content, ct)
 
 
 _seed()
@@ -113,31 +133,43 @@ class UploadRequest(BaseModel):
 
 @app.get("/documents/{document_id}")
 def get_document(document_id: str) -> dict:
-    doc = _store.get(document_id)
-    if not doc:
+    meta = _load_meta(document_id)
+    if not meta:
         raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+    content = _load_content(meta)
     return {
-        "document_id": doc.document_id,
-        "document_name": doc.document_name,
-        "document_type": doc.document_type,
-        "content_type": doc.content_type,
-        "content_base64": base64.b64encode(doc.content).decode(),
-        "related_application_id": doc.related_application_id,
+        "document_id": meta["document_id"],
+        "document_name": meta["document_name"],
+        "document_type": meta["document_type"],
+        "content_type": meta["content_type"],
+        "content_base64": base64.b64encode(content).decode(),
+        "related_application_id": meta["related_application_id"],
     }
+
+
+@app.get("/documents/{document_id}/raw")
+def get_document_raw(document_id: str):
+    """Serve raw file bytes with correct Content-Type (images render in browser)."""
+    meta = _load_meta(document_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+    content = _load_content(meta)
+    return Response(content=content, media_type=meta["content_type"])
 
 
 @app.get("/documents/{document_id}/metadata")
 def get_metadata(document_id: str) -> dict:
-    doc = _store.get(document_id)
-    if not doc:
+    meta = _load_meta(document_id)
+    if not meta:
         raise HTTPException(status_code=404, detail=f"Document {document_id} not found")
+    content = _load_content(meta)
     return {
-        "document_id": doc.document_id,
-        "document_name": doc.document_name,
-        "document_type": doc.document_type,
-        "content_type": doc.content_type,
-        "size_bytes": len(doc.content),
-        "related_application_id": doc.related_application_id,
+        "document_id": meta["document_id"],
+        "document_name": meta["document_name"],
+        "document_type": meta["document_type"],
+        "content_type": meta["content_type"],
+        "size_bytes": len(content),
+        "related_application_id": meta["related_application_id"],
     }
 
 
@@ -145,34 +177,29 @@ def get_metadata(document_id: str) -> dict:
 def upload_document(req: UploadRequest) -> dict:
     document_id = f"DMS-{uuid.uuid4().hex[:8].upper()}"
     content = base64.b64decode(req.content_base64)
-    _store[document_id] = StoredDocument(
-        document_id=document_id,
-        document_name=req.document_name,
-        document_type=req.document_type,
-        content=content,
-        content_type=req.content_type,
-        related_application_id=req.related_application_id,
-    )
+    _save(document_id, req.document_name, req.document_type,
+          content, req.content_type, req.related_application_id)
     return {"document_id": document_id, "document_name": req.document_name}
 
 
 @app.get("/documents")
 def list_documents() -> list[dict]:
-    return [
-        {
-            "document_id": d.document_id,
-            "document_name": d.document_name,
-            "document_type": d.document_type,
-            "size_bytes": len(d.content),
-            "related_application_id": d.related_application_id,
-        }
-        for d in _store.values()
-    ]
+    result = []
+    for meta in _all_meta():
+        content = _load_content(meta)
+        result.append({
+            "document_id": meta["document_id"],
+            "document_name": meta["document_name"],
+            "document_type": meta["document_type"],
+            "size_bytes": len(content),
+            "related_application_id": meta["related_application_id"],
+        })
+    return result
 
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "documents_stored": len(_store)}
+    return {"status": "ok", "documents_stored": len(list(META_DIR.glob("*.json")))}
 
 
 if __name__ == "__main__":

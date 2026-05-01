@@ -3,10 +3,13 @@ Sample Kafka events representing Siebel CRM submissions.
 Document IDs reference documents pre-seeded in the DMS mockup.
 """
 
+import uuid
+
+
 SAMPLE_EVENTS = [
     {
-        "event_id": "f7c3a1b2-4d5e-4a6f-8b9c-0d1e2f3a4b5c",
-        "application_id": "APP-2026-089341",
+        "event_id": str(uuid.uuid4()),
+        "application_id": "APP-" + str(uuid.uuid4())[:8],
         "product_type": "PERSONAL_FINANCE",
         "branch_name": "Riyadh Main Branch",
         "validator_id": "CRM-USR-4821",

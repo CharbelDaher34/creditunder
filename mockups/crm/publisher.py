@@ -9,6 +9,11 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from aiokafka import AIOKafkaProducer
 
@@ -33,7 +38,10 @@ async def publish(bootstrap_servers: str, topic: str, events: list[dict]) -> Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="CRM mockup publisher")
-    parser.add_argument("--bootstrap-servers", default="localhost:19092")
+    parser.add_argument(
+        "--bootstrap-servers",
+        default=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:19092"),
+    )
     parser.add_argument("--topic", default="credit-applications")
     parser.add_argument(
         "--event-index",

@@ -10,9 +10,9 @@ The full system design rationale is in [credit_underwriting_system_requirement.m
 
 ## Tech Stack
 
-- Python 3.11, **uv** for package management
+- Python 3.14, **uv** for package management
 - PostgreSQL + SQLAlchemy (asyncpg) + Alembic
-- Kafka via `aiokafka` (local dev: Redpanda in docker-compose)
+- Kafka via `aiokafka` (local dev: Kafka KRaft via `bitnami/kafka:3.7` in docker-compose — no ZooKeeper)
 - OpenAI-compatible AI client (`openai` SDK, configurable base URL / API key / model)
 - FastAPI + uvicorn for mockup services
 - Jinja2 + WeasyPrint for HTML-to-PDF report generation
@@ -27,8 +27,11 @@ uv sync
 # Run the processor (consumes Kafka, processes cases end-to-end)
 uv run python -m creditunder
 
-# Start all infrastructure (postgres, redpanda, DMS mockup, EDW mockup)
-docker-compose up
+# Start all infrastructure, run migrations, and start the processor in one command
+make infra
+
+# Start infrastructure only (detached), run migrations, but skip the processor
+make infra-bg
 
 # Apply database migrations
 uv run alembic upgrade head
@@ -59,6 +62,8 @@ src/creditunder/
 ├── config.py               # pydantic-settings: all env vars
 ├── observability.py        # structlog configuration
 ├── __main__.py             # entrypoint → ApplicationProcessor.run()
+├── Dockerfile              # Dockerfile for the processor
+├── entrypoint.sh           # Docker entrypoint (waits for infra, runs migrations)
 ├── domain/
 │   ├── enums.py            # ProductType, DocumentType, ValidationOutcome, Recommendation, …
 │   └── models.py           # ExtractedField[T], DocumentResult, CaseResult, ApplicationEvent
@@ -156,7 +161,9 @@ All calls use `response_format={"type": "json_object"}` and `temperature=0` (nar
 |---------|------|-------|
 | DMS | 8001 | Pre-seeded: `DMS-00192` (ID doc), `DMS-00193` (salary cert). `GET /documents/{id}`, `POST /documents`, `GET /health` |
 | EDW | 8002 | Idempotent on `application_id`. `POST /export`, `GET /exports/{application_id}`, `GET /health` |
-| Redpanda | 19092 | External listener for host. Internal docker network: `redpanda:9092` |
+| Kafka | 19092 | External listener for host (`EXTERNAL` listener). Internal docker network: `kafka:9092` (`PLAINTEXT` listener). KRaft mode — no ZooKeeper. |
+
+All host-side ports are set via `.env` variables (`POSTGRES_PORT`, `KAFKA_EXTERNAL_PORT`, `DMS_PORT`, `EDW_PORT`). Container-internal ports are fixed.
 
 ## Sample Data
 
@@ -166,4 +173,10 @@ All calls use `response_format={"type": "json_object"}` and `temperature=0` (nar
 
 ## Environment
 
-Copy `.env.example` to `.env`. Required: `AI_API_KEY`. All other vars default to docker-compose values.
+Copy `.env.example` to `.env`.
+
+**AI key (pick one):**
+- Set `OPENAI_API_KEY=sk-...` to use OpenAI directly — `AI_BASE_URL` and `AI_API_KEY` are ignored.
+- OR set `AI_BASE_URL` + `AI_API_KEY` for any OpenAI-compatible endpoint.
+
+All host-side ports have defaults but can be overridden via `POSTGRES_PORT`, `KAFKA_EXTERNAL_PORT`, `DMS_PORT`, `EDW_PORT`.

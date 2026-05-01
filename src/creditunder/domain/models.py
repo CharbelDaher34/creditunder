@@ -32,6 +32,8 @@ class ValidationResult:
     field_name: str | None = None
     extracted_value: Any | None = None
     expected_value: Any | None = None
+    confidence: float | None = None
+    manual_review_required: bool = False
 
 
 @dataclass
@@ -52,6 +54,8 @@ class CaseResult:
     validation_results: list[ValidationResult]
     recommendation: Recommendation
     recommendation_rationale: str
+    manual_review_required: bool = False
+    completed_at: datetime | None = None
 
 
 # Kafka inbound event model
