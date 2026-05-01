@@ -1,8 +1,19 @@
 FROM python:3.11-slim
+
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
+
 WORKDIR /app
-RUN pip install fastapi uvicorn[standard] aiokafka
-COPY mockups/crm/app.py /app/mockups/crm/app.py
-COPY mockups/__init__.py /app/mockups/__init__.py
-COPY mockups/crm/__init__.py /app/mockups/crm/__init__.py
+
+COPY mockups/crm/pyproject.toml mockups/crm/uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
+COPY mockups/crm/app.py ./mockups/crm/app.py
+COPY mockups/__init__.py ./mockups/__init__.py
+COPY mockups/crm/__init__.py ./mockups/crm/__init__.py
+COPY mockups/crm/publisher.py ./mockups/crm/publisher.py
+COPY mockups/crm/sample_data.py ./mockups/crm/sample_data.py
+
+ENV PATH="/app/.venv/bin:$PATH"
+
 EXPOSE 8003
 CMD ["python", "-m", "mockups.crm.app"]

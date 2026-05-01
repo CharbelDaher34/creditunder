@@ -64,7 +64,7 @@ services:
     environment:
       - DMS_PORT=8001
     volumes:
-      - dms_data:/data
+      - ./dms_data:/data
 
   edw:
     build:
@@ -115,7 +115,7 @@ services:
       - DMS_BASE_URL=http://dms:8001
       - EDW_BASE_URL=http://edw:8002
     volumes:
-      - processor_logs:/logs
+      - ./logs:/logs
     restart: on-failure
 
   workbench_api:
@@ -136,7 +136,7 @@ services:
       - CRM_BASE_URL=http://crm:8003
       - DMS_BASE_URL=http://dms:8001
     volumes:
-      - processor_logs:/logs
+      - ./logs:/logs
     ports:
       - "${WORKBENCH_API_PORT:-8004}:8004"
     restart: on-failure
@@ -153,6 +153,4 @@ services:
 
 volumes:
   postgres_data:
-  dms_data:
-  processor_logs:
 

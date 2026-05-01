@@ -13,6 +13,7 @@ dependencies = [
     "openai>=1.30.0",
     "psycopg2-binary>=2.9.9",
     "pydantic>=2.7.0",
+    "pydantic-ai>=1.89.0",
     "pydantic-settings>=2.3.0",
     "python-multipart>=0.0.9",
     "sqlalchemy[asyncio]>=2.0.0",
@@ -29,8 +30,8 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/creditunder"]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "black>=24.0.0",
     "flake8>=7.0.0",
     "isort>=5.13.0",

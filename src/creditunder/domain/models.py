@@ -1,6 +1,6 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Optional, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -15,8 +15,7 @@ from creditunder.domain.enums import (
 T = TypeVar("T")
 
 
-@dataclass
-class ExtractedField(Generic[T]):
+class ExtractedField(BaseModel, Generic[T]):
     value: T
     confidence: float
     source_document_name: str
@@ -58,7 +57,6 @@ class CaseResult:
     completed_at: datetime | None = None
 
 
-# Kafka inbound event model
 class ApplicationEvent(BaseModel):
     event_id: UUID
     application_id: str

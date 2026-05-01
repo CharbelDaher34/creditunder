@@ -61,61 +61,112 @@ def _all_meta() -> list[dict]:
 
 # ---- sample documents seeded at startup ----
 
-SAMPLE_ID_DOCUMENT = """\
-KINGDOM OF SAUDI ARABIA
-NATIONAL ID CARD
+_ID_DOCUMENT_ROWS = [
+    ("Document Type",  "National ID Card"),
+    ("Issuer",         "Kingdom of Saudi Arabia"),
+    ("Full Name",      "Mohammed Al-Harbi"),
+    ("ID Number",      "1082345678"),
+    ("Date of Birth",  "1985-04-12"),
+    ("Expiry Date",    "2028-09-30"),
+    ("Nationality",    "Saudi Arabian"),
+    ("Gender",         "Male"),
+    ("Place of Issue", "Riyadh"),
+]
 
-Full Name:    Mohammed Al-Harbi
-ID Number:    1082345678
-Date of Birth: 1985-04-12
-Expiry Date:  2028-09-30
-Nationality:  Saudi Arabian
-Gender:       Male
-Place of Issue: Riyadh
+_SALARY_CERT_ROWS = [
+    ("Document Type",     "Salary Certificate"),
+    ("Issuer",            "Saudi Aramco — Human Resources"),
+    ("Date",              "2026-04-15"),
+    ("Employee Name",     "Mohammed Al-Harbi"),
+    ("Employee ID",       "ARW-49821"),
+    ("Job Title",         "Senior Engineer"),
+    ("Basic Salary",      "SAR 15,000.00"),
+    ("Housing Allowance", "SAR 3,000.00"),
+    ("Transport Allow.",  "SAR 500.00"),
+    ("Total Salary",      "SAR 18,500.00"),
+    ("Employment Since",  "March 2010"),
+    ("Purpose",           "Bank financing"),
+]
 
-This document certifies that the above-named individual is a
-registered Saudi national. Valid for all official purposes.
-""".strip()
 
-SAMPLE_SALARY_CERTIFICATE = """\
-SAUDI ARAMCO
-Human Resources Department
-P.O. Box 5000, Dhahran 31311, Saudi Arabia
+def _render_document_image(title: str, rows: list[tuple[str, str]]) -> bytes:
+    """Render a two-column table as a PNG image and return the bytes."""
+    from PIL import Image, ImageDraw, ImageFont
+    import io
 
-SALARY CERTIFICATE
+    # Layout constants
+    PAD = 40
+    HEADER_H = 60
+    ROW_H = 36
+    COL1_W = 220
+    COL2_W = 340
+    WIDTH = PAD * 2 + COL1_W + COL2_W + 1  # +1 for divider line
+    HEIGHT = PAD + HEADER_H + ROW_H * len(rows) + PAD
 
-Date: 2026-04-15
+    BG       = (245, 247, 250)
+    HEADER_BG= (30,  60, 114)
+    ROW_ALT  = (255, 255, 255)
+    ROW_EVEN = (235, 240, 248)
+    BORDER   = (180, 190, 210)
+    TEXT_HDR = (255, 255, 255)
+    TEXT_KEY = (50,  70, 110)
+    TEXT_VAL = (20,  20,  40)
 
-To Whom It May Concern,
+    img = Image.new("RGB", (WIDTH, HEIGHT), BG)
+    draw = ImageDraw.Draw(img)
 
-This is to certify that Mr. Mohammed Al-Harbi, holding Employee ID ARW-49821,
-is employed with Saudi Aramco as a Senior Engineer.
+    # Try to load a bundled font; fall back to default
+    try:
+        font_bold  = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 15)
+        font_reg   = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 13)
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 17)
+    except OSError:
+        font_bold = font_reg = font_title = ImageFont.load_default()
 
-Monthly Salary Breakdown:
-  Basic Salary:          SAR 15,000.00
-  Housing Allowance:     SAR 3,000.00
-  Transport Allowance:   SAR 500.00
-  Total Monthly Salary:  SAR 18,500.00
+    # Header bar
+    draw.rectangle([(0, PAD), (WIDTH, PAD + HEADER_H)], fill=HEADER_BG)
+    draw.text((PAD, PAD + 14), title, font=font_title, fill=TEXT_HDR)
 
-Mr. Al-Harbi has been in continuous employment since March 2010 and is in
-good standing with the company.
+    # Rows
+    for i, (key, val) in enumerate(rows):
+        y = PAD + HEADER_H + i * ROW_H
+        row_bg = ROW_EVEN if i % 2 == 0 else ROW_ALT
+        draw.rectangle([(0, y), (WIDTH, y + ROW_H)], fill=row_bg)
+        # Column divider
+        draw.line([(PAD + COL1_W, y), (PAD + COL1_W, y + ROW_H)], fill=BORDER, width=1)
+        # Row bottom border
+        draw.line([(0, y + ROW_H - 1), (WIDTH, y + ROW_H - 1)], fill=BORDER, width=1)
+        # Text
+        draw.text((PAD + 6, y + 9), key, font=font_bold, fill=TEXT_KEY)
+        draw.text((PAD + COL1_W + 10, y + 9), val, font=font_reg, fill=TEXT_VAL)
 
-This certificate is issued upon the employee's request for bank purposes.
+    # Outer border
+    draw.rectangle([(0, PAD), (WIDTH - 1, HEIGHT - 1)], outline=BORDER, width=2)
 
-Authorised Signatory
-Saudi Aramco HR Department
-""".strip()
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
 
 
 def _seed() -> None:
-    for doc_id, name, doc_type, content, ct in [
-        ("DMS-00192", "national_id_al_harbi.txt", "ID_DOCUMENT",
-         SAMPLE_ID_DOCUMENT.encode(), "text/plain"),
-        ("DMS-00193", "salary_certificate_al_harbi.txt", "SALARY_CERTIFICATE",
-         SAMPLE_SALARY_CERTIFICATE.encode(), "text/plain"),
+    for doc_id, name, doc_type, title, rows in [
+        (
+            "DMS-00192",
+            "national_id_al_harbi.png",
+            "ID_DOCUMENT",
+            "NATIONAL ID CARD",
+            _ID_DOCUMENT_ROWS,
+        ),
+        (
+            "DMS-00193",
+            "salary_certificate_al_harbi.png",
+            "SALARY_CERTIFICATE",
+            "SALARY CERTIFICATE",
+            _SALARY_CERT_ROWS,
+        ),
     ]:
         if not _meta_path(doc_id).exists():
-            _save(doc_id, name, doc_type, content, ct)
+            _save(doc_id, name, doc_type, _render_document_image(title, rows), "image/png")
 
 
 _seed()

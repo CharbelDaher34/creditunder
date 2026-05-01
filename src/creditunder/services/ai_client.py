@@ -1,114 +1,133 @@
 import json
-import re
-from typing import Any
+from typing import Any, Optional
 
 import structlog
-from openai import AsyncOpenAI
 from pydantic import BaseModel
+from pydantic_ai import Agent, BinaryContent, TextContent
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from creditunder.domain.enums import DocumentType
-from creditunder.documents.base import BaseExtractionSchema
+from creditunder.domain.models import ExtractedField
 from creditunder.documents import EXTRACTION_SCHEMA_REGISTRY
+from creditunder.documents.base import BaseExtractionSchema
 
 log = structlog.get_logger(__name__)
 
+_agent_cache: dict[DocumentType, Agent] = {}
 
-class VerificationResult(BaseModel):
+
+def _get_agent(document_type: DocumentType, model: OpenAIChatModel) -> Agent:
+    if document_type not in _agent_cache:
+        schema_cls = EXTRACTION_SCHEMA_REGISTRY[document_type]
+        verification_fields = schema_cls.verification_field_names()
+        extraction_fields = [f for f in schema_cls.model_fields if f not in verification_fields]
+
+        system_prompt = (
+            "You are a document verification and data extraction specialist for a bank.\n\n"
+            f"VERIFICATION CRITERIA:\n{schema_cls.verification_prompt()}\n\n"
+            f"EXTRACTION INSTRUCTIONS:\n{schema_cls.extraction_prompt()}\n\n"
+            "INSTRUCTIONS:\n"
+            "1. Fill the verification fields: is_correct_type, verification_confidence, detected_type, verification_notes.\n"
+            f"2. If the document is the correct type, extract every field: {', '.join(extraction_fields)}.\n"
+            "3. If it is NOT the correct type, leave all extraction fields as null.\n"
+            "4. For each field provide: value, confidence (0.0-1.0), page_reference (1-indexed), normalized_label.\n"
+            "   source_document_name should be set to the document name provided in the user message."
+        )
+
+        _agent_cache[document_type] = Agent(
+            model=model,
+            output_type=schema_cls,
+            system_prompt=system_prompt,
+        )
+    return _agent_cache[document_type]
+
+
+class VerifyAndExtractResult(BaseModel):
     is_correct_type: bool
-    confidence: float
+    verification_confidence: float
     detected_type: str
-    notes: str = ""
+    verification_notes: Optional[str] = None
+    extracted_fields: dict[str, ExtractedField]
 
 
 class AIClient:
     def __init__(self, base_url: str, api_key: str, model: str, confidence_threshold: float = 0.7):
-        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
-        self._model = model
+        self._model = OpenAIChatModel(
+            model,
+            provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+        )
         self._confidence_threshold = confidence_threshold
 
-    async def verify_document_type(
+    async def verify_and_extract(
         self,
-        document_content: str,
+        document_content: bytes,
+        document_content_type: str,
         document_name: str,
         expected_type: DocumentType,
-    ) -> VerificationResult:
-        system_prompt = (
-            "You are a document verification specialist. "
-            "Given document content, determine if it is the expected document type. "
-            "Respond with JSON only matching the schema provided."
-        )
-        user_prompt = (
+    ) -> VerifyAndExtractResult:
+        if expected_type not in EXTRACTION_SCHEMA_REGISTRY:
+            raise ValueError(f"No extraction schema registered for {expected_type}")
+
+        agent = _get_agent(expected_type, self._model)
+        schema_cls = EXTRACTION_SCHEMA_REGISTRY[expected_type]
+        verification_fields = schema_cls.verification_field_names()
+
+        header = (
             f"Document name: {document_name}\n"
             f"Expected document type: {expected_type.value}\n\n"
-            f"Document content:\n{document_content}\n\n"
-            "Verify whether this document matches the expected type. "
-            "Return JSON with fields: is_correct_type (bool), confidence (0.0-1.0), "
-            "detected_type (string), notes (string)."
         )
 
-        log.info("ai.verify_document_type", document_name=document_name, expected_type=expected_type)
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
+        if document_content_type.startswith("image/"):
+            user_message = [
+                TextContent(content=header + "Analyse the document image below."),
+                BinaryContent(data=document_content, media_type=document_content_type),
+            ]
+        else:
+            text = document_content.decode("utf-8", errors="replace")
+            user_message = header + f"Document content:\n{text}"
+
+        log.info("ai.verify_and_extract", document_name=document_name, expected_type=expected_type)
+
+        result = await agent.run(user_message)
+        data: BaseExtractionSchema = result.output
+
+        is_correct = data.is_correct_type.value
+        v_confidence = data.verification_confidence.value
+        detected = data.detected_type.value
+        notes_field = data.verification_notes
+        notes = notes_field.value if notes_field is not None else None
+
+        extracted: dict[str, ExtractedField] = {}
+        if is_correct:
+            for field_name in schema_cls.model_fields:
+                if field_name in verification_fields:
+                    continue
+                field_obj = getattr(data, field_name, None)
+                if field_obj is not None:
+                    extracted[field_name] = field_obj
+
+        return VerifyAndExtractResult(
+            is_correct_type=is_correct,
+            verification_confidence=v_confidence,
+            detected_type=detected,
+            verification_notes=notes,
+            extracted_fields=extracted,
         )
-        raw = response.choices[0].message.content
-        return VerificationResult.model_validate_json(raw)
-
-    async def extract_document_data(
-        self,
-        document_content: str,
-        document_name: str,
-        document_type: DocumentType,
-    ) -> dict[str, Any]:
-        schema_cls = EXTRACTION_SCHEMA_REGISTRY.get(document_type)
-        if schema_cls is None:
-            raise ValueError(f"No extraction schema registered for {document_type}")
-
-        json_schema = schema_cls.model_json_schema()
-        extraction_prompt = schema_cls.extraction_prompt()
-
-        system_prompt = (
-            f"{extraction_prompt}\n\n"
-            "For each field, also provide a confidence score (0.0-1.0) and the page number (1-indexed). "
-            "Return a JSON object where each key maps to an object with: "
-            "value, confidence (float 0-1), page_reference (int), normalized_label (string). "
-            f"The fields to extract are defined by this schema:\n{json.dumps(json_schema, indent=2)}"
-        )
-        user_prompt = f"Document name: {document_name}\n\nDocument content:\n{document_content}"
-
-        log.info("ai.extract_document_data", document_name=document_name, document_type=document_type)
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-        )
-        return json.loads(response.choices[0].message.content)
 
     async def generate_narrative(self, case_summary: dict[str, Any]) -> str:
-        system_prompt = (
-            "You are a credit analyst writing a formal report narrative for a bank validator. "
-            "Write a concise, professional summary (3-5 paragraphs) covering: "
-            "document verification status, key extracted data, validation findings, and the recommendation. "
-            "Be factual and objective. Do not use bullet points — use flowing prose."
-        )
-        user_prompt = f"Case data:\n{json.dumps(case_summary, indent=2, default=str)}"
-
-        log.info("ai.generate_narrative", application_id=case_summary.get("application_id"))
-        response = await self._client.chat.completions.create(
+        narrative_agent = Agent(
             model=self._model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.3,
+            system_prompt=(
+                "You are a credit analyst writing a formal report narrative for a bank validator. "
+                "Write a concise, professional summary (3-5 paragraphs) covering: "
+                "document verification status, key extracted data, validation findings, and the recommendation. "
+                "Be factual and objective. Do not use bullet points — use flowing prose."
+            ),
         )
-        return response.choices[0].message.content
+
+        user_message = f"Case data:\n{json.dumps(case_summary, indent=2, default=str)}"
+        log.info("ai.generate_narrative", application_id=case_summary.get("application_id"))
+
+        result = await narrative_agent.run(user_message)
+        return result.output

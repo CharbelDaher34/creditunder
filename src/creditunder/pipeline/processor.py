@@ -2,11 +2,12 @@ import asyncio
 import json
 import traceback
 from datetime import datetime, timezone
-from uuid import UUID, uuid4
+from typing import Awaitable, Callable, TypeVar
+from uuid import UUID
 
 import structlog
 from aiokafka import AIOKafkaConsumer
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -26,12 +27,17 @@ from creditunder.db.models import (
     ValidationResultRow,
 )
 from creditunder.db.session import AsyncSessionLocal
-from creditunder.domain.enums import CaseStatus, DocumentStatus, EDWStatus
+from creditunder.domain.enums import (
+    CaseStatus,
+    DocumentStatus,
+    DocumentType,
+    EDWStatus,
+    ValidationOutcome,
+)
 from creditunder.domain.models import (
     ApplicationEvent,
     CaseResult,
     DocumentResult,
-    ExtractedField,
 )
 from creditunder.handlers.registry import get_handler
 from creditunder.pipeline.report_generator import ReportGenerator
@@ -43,17 +49,25 @@ log = structlog.get_logger(__name__)
 
 _ACTOR = "application_processor"
 
-# Per-stage timeout budgets (seconds) — must sum well within 30s SLA
+# Per-stage timeout budgets (seconds) — must sum well within 30s SLA.
 _TIMEOUT_DMS_FETCH = 10.0
-_TIMEOUT_AI_VERIFY = 15.0
-_TIMEOUT_AI_EXTRACT = 20.0
+_TIMEOUT_AI_VERIFY_AND_EXTRACT = 25.0
 _TIMEOUT_AI_NARRATIVE = 20.0
 _TIMEOUT_DMS_UPLOAD = 10.0
 _TIMEOUT_EDW_EXPORT = 30.0
 
-# Retry config
 _MAX_ATTEMPTS = 3
-_RETRY_BASE_DELAY = 1.0  # doubles each attempt: 1s, 2s, 4s
+_RETRY_BASE_DELAY = 1.0  # exponential: 1s, 2s, 4s
+
+T = TypeVar("T")
+
+
+def _enum_val(x):
+    return x.value if hasattr(x, "value") else x
+
+
+def _str_or_none(x) -> str | None:
+    return str(x) if x is not None else None
 
 
 class ApplicationProcessor:
@@ -91,7 +105,7 @@ class ApplicationProcessor:
             await consumer.stop()
 
     # ------------------------------------------------------------------ #
-    #  Message entry point                                                  #
+    #  Message ingest                                                       #
     # ------------------------------------------------------------------ #
 
     async def _handle_message(self, raw: dict) -> None:
@@ -109,18 +123,21 @@ class ApplicationProcessor:
             )
             return
 
-        log.info("event.received", application_id=event.application_id, event_id=str(event.event_id))
+        log.info(
+            "event.received",
+            application_id=event.application_id,
+            event_id=str(event.event_id),
+        )
 
         async with AsyncSessionLocal() as session:
             try:
-                inbound = InboundApplicationEvent(
+                session.add(InboundApplicationEvent(
                     event_id=event.event_id,
                     application_id=event.application_id,
                     product_type=event.product_type,
                     raw_payload=raw,
                     status="RECEIVED",
-                )
-                session.add(inbound)
+                ))
                 await session.flush()
             except IntegrityError:
                 await session.rollback()
@@ -132,17 +149,12 @@ class ApplicationProcessor:
 
         await self._process_case(event, case_row.id)
 
-    # ------------------------------------------------------------------ #
-    #  Case creation                                                        #
-    # ------------------------------------------------------------------ #
-
     async def _get_or_create_case(
         self, session: AsyncSession, event: ApplicationEvent
     ) -> ApplicationCase:
-        result = await session.execute(
+        existing = await session.scalar(
             select(ApplicationCase).where(ApplicationCase.application_id == event.application_id)
         )
-        existing = result.scalar_one_or_none()
         if existing:
             return existing
 
@@ -179,59 +191,25 @@ class ApplicationProcessor:
             )
             return
 
-        # Fetch and verify/extract each document
-        document_results: list[DocumentResult] = []
-        for doc_id in event.document_ids:
-            doc_result = await self._process_document(
-                event=event, case_id=case_id, document_id=doc_id
-            )
-            if doc_result:
-                document_results.append(doc_result)
+        # Fetch + verify + extract every document concurrently.
+        results = await asyncio.gather(*[
+            self._process_document(event, case_id, doc_id) for doc_id in event.document_ids
+        ])
+        document_results: list[DocumentResult] = [r for r in results if r is not None]
 
-        # Completeness check — required document types must be represented
-        from creditunder.domain.enums import DocumentType
-        required = set(handler.required_documents)
-        available = {dr.document_type for dr in document_results}
-        missing = required - available
+        # Completeness check — required document types must be represented.
+        missing = set(handler.required_documents) - {dr.document_type for dr in document_results}
         if missing:
-            missing_names = ", ".join(str(t) for t in missing)
-            log.warning(
-                "case.missing_required_documents",
-                application_id=event.application_id,
-                missing=missing_names,
-            )
-            await self._dead_letter(
-                event_id=str(event.event_id),
-                application_id=event.application_id,
-                case_id=case_id,
-                reason_code="MISSING_REQUIRED_DOCUMENTS",
-                error=f"Required document types not found: {missing_names}",
-                raw_payload=event.model_dump(mode="json"),
-            )
-            async with AsyncSessionLocal() as session:
-                await session.execute(
-                    update(ApplicationCase).where(ApplicationCase.id == case_id).values(
-                        status=CaseStatus.MANUAL_INTERVENTION_REQUIRED
-                    )
-                )
-                await self._audit(
-                    session, case_id, event.application_id, "MISSING_REQUIRED_DOCUMENTS",
-                    {"missing": missing_names}, actor=_ACTOR,
-                )
-                await session.commit()
+            await self._handle_missing_documents(event, case_id, missing)
             return
 
-        # Run product validation rules
         validation_results, recommendation, rationale = handler.validate(
             application_id=event.application_id,
             applicant_data=event.applicant_data,
             document_results=document_results,
         )
-
-        manual_review_required = any(
-            vr.manual_review_required for vr in validation_results
-        )
-        handler_completed_at = datetime.now(timezone.utc)
+        manual_review_required = any(vr.manual_review_required for vr in validation_results)
+        completed_at = datetime.now(timezone.utc)
 
         case_result = CaseResult(
             application_id=event.application_id,
@@ -241,90 +219,120 @@ class ApplicationProcessor:
             recommendation=recommendation,
             recommendation_rationale=rationale,
             manual_review_required=manual_review_required,
-            completed_at=handler_completed_at,
+            completed_at=completed_at,
         )
 
-        async with AsyncSessionLocal() as session:
-            # Persist validation results (append-only)
-            for vr in validation_results:
-                outcome_val = vr.outcome.value if hasattr(vr.outcome, "value") else vr.outcome
-                is_manual = (
-                    vr.outcome == "MANUAL_REVIEW_REQUIRED"
-                    or str(vr.outcome) == "MANUAL_REVIEW_REQUIRED"
-                    or vr.manual_review_required
-                )
-                session.add(
-                    ValidationResultRow(
-                        case_id=case_id,
-                        rule_code=vr.rule_code,
-                        outcome=outcome_val,
-                        description=vr.description,
-                        field_name=vr.field_name,
-                        extracted_value=(
-                            str(vr.extracted_value) if vr.extracted_value is not None else None
-                        ),
-                        expected_value=(
-                            str(vr.expected_value) if vr.expected_value is not None else None
-                        ),
-                        confidence=vr.confidence,
-                        manual_review_required=is_manual,
-                        input_data={
-                            "field_name": vr.field_name,
-                            "extracted_value": str(vr.extracted_value)
-                            if vr.extracted_value is not None
-                            else None,
-                        },
-                        details={
-                            "description": vr.description,
-                            "expected_value": str(vr.expected_value)
-                            if vr.expected_value is not None
-                            else None,
-                        },
-                    )
-                )
+        await self._persist_validation(
+            case_id=case_id,
+            application_id=event.application_id,
+            validation_results=validation_results,
+            document_results=document_results,
+            recommendation=recommendation,
+            rationale=rationale,
+            manual_review_required=manual_review_required,
+            completed_at=completed_at,
+        )
 
-            # Persist aggregated case_result row (handler completion time)
-            session.add(
-                CaseResultRow(
-                    case_id=case_id,
-                    recommendation=recommendation.value
-                    if hasattr(recommendation, "value")
-                    else recommendation,
-                    manual_review_required=manual_review_required,
-                    completed_at=handler_completed_at,
+        await self._generate_and_deliver_report(event, case_id, case_result)
+
+    async def _handle_missing_documents(
+        self, event: ApplicationEvent, case_id: UUID, missing: set
+    ) -> None:
+        missing_names = ", ".join(str(t) for t in missing)
+        log.warning(
+            "case.missing_required_documents",
+            application_id=event.application_id,
+            missing=missing_names,
+        )
+        await self._dead_letter(
+            event_id=str(event.event_id),
+            application_id=event.application_id,
+            case_id=case_id,
+            reason_code="MISSING_REQUIRED_DOCUMENTS",
+            error=f"Required document types not found: {missing_names}",
+            raw_payload=event.model_dump(mode="json"),
+        )
+        async with AsyncSessionLocal() as session:
+            await session.execute(
+                update(ApplicationCase).where(ApplicationCase.id == case_id).values(
+                    status=CaseStatus.MANUAL_INTERVENTION_REQUIRED
                 )
             )
+            await self._audit(
+                session, case_id, event.application_id, "MISSING_REQUIRED_DOCUMENTS",
+                {"missing": missing_names}, actor=_ACTOR,
+            )
+            await session.commit()
 
-            # Update case with recommendation and mark validated documents
+    async def _persist_validation(
+        self,
+        *,
+        case_id: UUID,
+        application_id: str,
+        validation_results,
+        document_results: list[DocumentResult],
+        recommendation,
+        rationale: str,
+        manual_review_required: bool,
+        completed_at: datetime,
+    ) -> None:
+        rec_str = _enum_val(recommendation)
+        async with AsyncSessionLocal() as session:
+            for vr in validation_results:
+                ev_str = _str_or_none(vr.extracted_value)
+                exp_str = _str_or_none(vr.expected_value)
+                is_manual = (
+                    vr.manual_review_required
+                    or vr.outcome == ValidationOutcome.MANUAL_REVIEW_REQUIRED
+                )
+                session.add(ValidationResultRow(
+                    case_id=case_id,
+                    rule_code=vr.rule_code,
+                    outcome=_enum_val(vr.outcome),
+                    description=vr.description,
+                    field_name=vr.field_name,
+                    extracted_value=ev_str,
+                    expected_value=exp_str,
+                    confidence=vr.confidence,
+                    manual_review_required=is_manual,
+                    input_data={"field_name": vr.field_name, "extracted_value": ev_str},
+                    details={"description": vr.description, "expected_value": exp_str},
+                ))
+
+            session.add(CaseResultRow(
+                case_id=case_id,
+                recommendation=rec_str,
+                manual_review_required=manual_review_required,
+                completed_at=completed_at,
+            ))
+
             await session.execute(
-                update(ApplicationCase)
-                .where(ApplicationCase.id == case_id)
-                .values(
-                    recommendation=recommendation.value
-                    if hasattr(recommendation, "value")
-                    else recommendation,
+                update(ApplicationCase).where(ApplicationCase.id == case_id).values(
+                    recommendation=rec_str,
                     recommendation_rationale=rationale,
                     manual_review_required=manual_review_required,
                 )
             )
-            # Advance each successfully extracted document to VALIDATION_COMPLETED
-            for dr in document_results:
-                if dr.verification_passed and dr.extracted_data:
-                    await session.execute(
-                        update(CaseDocument)
-                        .where(
-                            CaseDocument.case_id == case_id,
-                            CaseDocument.dms_document_id == dr.document_id,
-                        )
-                        .values(status=DocumentStatus.VALIDATION_COMPLETED)
+
+            verified_doc_ids = [
+                dr.document_id for dr in document_results
+                if dr.verification_passed and dr.extracted_data
+            ]
+            if verified_doc_ids:
+                await session.execute(
+                    update(CaseDocument)
+                    .where(
+                        CaseDocument.case_id == case_id,
+                        CaseDocument.dms_document_id.in_(verified_doc_ids),
                     )
+                    .values(status=DocumentStatus.VALIDATION_COMPLETED)
+                )
+
             await self._audit(
-                session, case_id, event.application_id, "VALIDATION_COMPLETED",
-                {"recommendation": str(recommendation)}, actor=_ACTOR,
+                session, case_id, application_id, "VALIDATION_COMPLETED",
+                {"recommendation": rec_str}, actor=_ACTOR,
             )
             await session.commit()
-
-        await self._generate_and_deliver_report(event, case_id, case_result)
 
     # ------------------------------------------------------------------ #
     #  Document processing                                                  #
@@ -333,6 +341,7 @@ class ApplicationProcessor:
     async def _process_document(
         self, event: ApplicationEvent, case_id: UUID, document_id: str
     ) -> DocumentResult | None:
+        # Reserve a row for this document.
         async with AsyncSessionLocal() as session:
             doc_row = CaseDocument(
                 case_id=case_id, dms_document_id=document_id, status=DocumentStatus.PENDING
@@ -342,7 +351,7 @@ class ApplicationProcessor:
             doc_row_id = doc_row.id
             await session.commit()
 
-        # Stage: DOCUMENT_FETCH
+        # Stage 1: fetch from DMS.
         try:
             dms_doc = await self._run_with_job(
                 case_id=case_id,
@@ -358,21 +367,16 @@ class ApplicationProcessor:
                         status=DocumentStatus.EXTRACTION_FAILED
                     )
                 )
-                session.add(
-                    DMSArtifact(
-                        case_id=case_id,
-                        dms_document_id=document_id,
-                        artifact_type="SOURCE_DOCUMENT",
-                        direction="INBOUND",
-                        status="FAILED",
-                        error_details={"error": str(exc)},
-                    )
-                )
+                session.add(DMSArtifact(
+                    case_id=case_id,
+                    dms_document_id=document_id,
+                    artifact_type="SOURCE_DOCUMENT",
+                    direction="INBOUND",
+                    status="FAILED",
+                    error_details={"error": str(exc)},
+                ))
                 await session.commit()
             return None
-
-        document_content = dms_doc.content.decode("utf-8", errors="replace")
-        now = datetime.now(timezone.utc)
 
         async with AsyncSessionLocal() as session:
             await session.execute(
@@ -380,21 +384,18 @@ class ApplicationProcessor:
                     status=DocumentStatus.FETCHED,
                     document_name=dms_doc.document_name,
                     document_type=dms_doc.document_type,
-                    fetched_at=now,
+                    fetched_at=datetime.now(timezone.utc),
                 )
             )
-            session.add(
-                DMSArtifact(
-                    case_id=case_id,
-                    dms_document_id=document_id,
-                    artifact_type="SOURCE_DOCUMENT",
-                    direction="INBOUND",
-                    status="SUCCESS",
-                )
-            )
+            session.add(DMSArtifact(
+                case_id=case_id,
+                dms_document_id=document_id,
+                artifact_type="SOURCE_DOCUMENT",
+                direction="INBOUND",
+                status="SUCCESS",
+            ))
             await session.commit()
 
-        from creditunder.domain.enums import DocumentType
         try:
             expected_type = DocumentType(dms_doc.document_type)
         except ValueError:
@@ -405,20 +406,25 @@ class ApplicationProcessor:
             )
             return None
 
-        # Stage: VERIFICATION
+        # Stage 2: AI verify + extract (single LLM call).
         try:
-            verification = await self._run_with_job(
+            ai_result = await self._run_with_job(
                 case_id=case_id,
-                job_type="VERIFICATION",
-                coro_fn=lambda: self._ai.verify_document_type(
-                    document_content=document_content,
+                job_type="VERIFY_AND_EXTRACT",
+                coro_fn=lambda: self._ai.verify_and_extract(
+                    document_content=dms_doc.content,
+                    document_content_type=dms_doc.content_type,
                     document_name=dms_doc.document_name,
                     expected_type=expected_type,
                 ),
-                timeout=_TIMEOUT_AI_VERIFY,
+                timeout=_TIMEOUT_AI_VERIFY_AND_EXTRACT,
             )
         except Exception as exc:
-            log.error("document.verification_error", document_id=document_id, error=str(exc))
+            log.error(
+                "document.verify_and_extract_error",
+                document_id=document_id,
+                error=str(exc),
+            )
             async with AsyncSessionLocal() as session:
                 await session.execute(
                     update(CaseDocument).where(CaseDocument.id == doc_row_id).values(
@@ -435,18 +441,35 @@ class ApplicationProcessor:
                 extracted_data={},
             )
 
+        is_verified = ai_result.is_correct_type
         verified_at = datetime.now(timezone.utc)
-        is_verified = verification.is_correct_type
-        doc_status = (
-            DocumentStatus.VERIFIED if is_verified else DocumentStatus.TYPE_MISMATCH
-        )
 
+        # Single transaction: persist verification result and (when verified)
+        # the extracted-fields version row + EXTRACTED status.
         async with AsyncSessionLocal() as session:
+            if is_verified:
+                last_version = await session.scalar(
+                    select(func.max(StageOutputVersion.version)).where(
+                        StageOutputVersion.case_document_id == doc_row_id
+                    )
+                )
+                session.add(StageOutputVersion(
+                    case_document_id=doc_row_id,
+                    version=(last_version or 0) + 1,
+                    raw_extraction={
+                        k: v.model_dump() for k, v in ai_result.extracted_fields.items()
+                    },
+                    is_valid=True,
+                ))
+                new_status = DocumentStatus.EXTRACTED
+            else:
+                new_status = DocumentStatus.TYPE_MISMATCH
+
             await session.execute(
                 update(CaseDocument).where(CaseDocument.id == doc_row_id).values(
                     verification_passed=is_verified,
-                    verification_confidence=verification.confidence,
-                    status=doc_status,
+                    verification_confidence=ai_result.verification_confidence,
+                    status=new_status,
                     verified_at=verified_at,
                 )
             )
@@ -456,83 +479,24 @@ class ApplicationProcessor:
             log.warning(
                 "document.type_mismatch",
                 document_id=document_id,
-                detected=verification.detected_type,
+                detected=ai_result.detected_type,
             )
             return DocumentResult(
                 document_id=document_id,
                 document_type=expected_type,
                 document_name=dms_doc.document_name,
                 verification_passed=False,
-                verification_confidence=verification.confidence,
+                verification_confidence=ai_result.verification_confidence,
                 extracted_data={},
             )
-
-        # Stage: EXTRACTION
-        try:
-            raw_extraction = await self._run_with_job(
-                case_id=case_id,
-                job_type="EXTRACTION",
-                coro_fn=lambda: self._ai.extract_document_data(
-                    document_content=document_content,
-                    document_name=dms_doc.document_name,
-                    document_type=expected_type,
-                ),
-                timeout=_TIMEOUT_AI_EXTRACT,
-            )
-            extraction_valid = True
-            extraction_error = None
-        except Exception as exc:
-            log.error("document.extraction_failed", document_id=document_id, error=str(exc))
-            raw_extraction = {}
-            extraction_valid = False
-            extraction_error = str(exc)
-
-        async with AsyncSessionLocal() as session:
-            existing_versions = await session.execute(
-                select(StageOutputVersion).where(
-                    StageOutputVersion.case_document_id == doc_row_id
-                )
-            )
-            version = len(existing_versions.scalars().all()) + 1
-            session.add(
-                StageOutputVersion(
-                    case_document_id=doc_row_id,
-                    version=version,
-                    raw_extraction=raw_extraction,
-                    is_valid=extraction_valid,
-                    validation_error=extraction_error,
-                )
-            )
-            await session.execute(
-                update(CaseDocument).where(CaseDocument.id == doc_row_id).values(
-                    status=DocumentStatus.EXTRACTED
-                    if extraction_valid
-                    else DocumentStatus.EXTRACTION_FAILED
-                )
-            )
-            await session.commit()
-
-        if not extraction_valid:
-            return None
-
-        extracted_data: dict[str, ExtractedField] = {}
-        for field_name, field_data in raw_extraction.items():
-            if isinstance(field_data, dict) and "value" in field_data:
-                extracted_data[field_name] = ExtractedField(
-                    value=field_data["value"],
-                    confidence=float(field_data.get("confidence", 0.5)),
-                    source_document_name=dms_doc.document_name,
-                    page_reference=int(field_data.get("page_reference", 1)),
-                    normalized_label=field_data.get("normalized_label", field_name),
-                )
 
         return DocumentResult(
             document_id=document_id,
             document_type=expected_type,
             document_name=dms_doc.document_name,
             verification_passed=True,
-            verification_confidence=verification.confidence,
-            extracted_data=extracted_data,
+            verification_confidence=ai_result.verification_confidence,
+            extracted_data=ai_result.extracted_fields,
         )
 
     # ------------------------------------------------------------------ #
@@ -562,7 +526,11 @@ class ApplicationProcessor:
                 timeout=_TIMEOUT_AI_NARRATIVE + 10.0,  # narrative + rendering budget
             )
         except Exception as exc:
-            log.error("report.generation_failed", application_id=event.application_id, error=str(exc))
+            log.error(
+                "report.generation_failed",
+                application_id=event.application_id,
+                error=str(exc),
+            )
             async with AsyncSessionLocal() as session:
                 await session.execute(
                     update(CaseReport).where(CaseReport.id == report_id).values(status="FAILED")
@@ -570,22 +538,20 @@ class ApplicationProcessor:
                 await session.commit()
             return
 
-        html_generated_at = datetime.now(timezone.utc)
-        pdf_generated_at = datetime.now(timezone.utc)
-
+        ready_at = datetime.now(timezone.utc)
         async with AsyncSessionLocal() as session:
             await session.execute(
                 update(CaseReport).where(CaseReport.id == report_id).values(
                     html_content=html,
                     narrative=narrative,
-                    html_generated_at=html_generated_at,
-                    pdf_generated_at=pdf_generated_at,
+                    html_generated_at=ready_at,
+                    pdf_generated_at=ready_at,
                     status="PDF_READY",
                 )
             )
             await session.commit()
 
-        # Stage: DMS upload (PDF report)
+        # Stage: DMS upload (PDF report).
         try:
             pdf_doc_id = await self._run_with_job(
                 case_id=case_id,
@@ -600,45 +566,44 @@ class ApplicationProcessor:
                 timeout=_TIMEOUT_DMS_UPLOAD,
             )
         except Exception as exc:
-            log.error("report.upload_failed", application_id=event.application_id, error=str(exc))
+            log.error(
+                "report.upload_failed",
+                application_id=event.application_id,
+                error=str(exc),
+            )
             async with AsyncSessionLocal() as session:
                 await session.execute(
                     update(CaseReport).where(CaseReport.id == report_id).values(
                         status="UPLOAD_FAILED"
                     )
                 )
-                session.add(
-                    DMSArtifact(
-                        case_id=case_id,
-                        dms_document_id="",
-                        artifact_type="PDF_REPORT",
-                        direction="OUTBOUND",
-                        status="FAILED",
-                        error_details={"error": str(exc)},
-                    )
-                )
+                session.add(DMSArtifact(
+                    case_id=case_id,
+                    dms_document_id="",
+                    artifact_type="PDF_REPORT",
+                    direction="OUTBOUND",
+                    status="FAILED",
+                    error_details={"error": str(exc)},
+                ))
                 await session.commit()
             return
 
-        pdf_uploaded_at = datetime.now(timezone.utc)
-
+        uploaded_at = datetime.now(timezone.utc)
         async with AsyncSessionLocal() as session:
             await session.execute(
                 update(CaseReport).where(CaseReport.id == report_id).values(
                     pdf_dms_document_id=pdf_doc_id,
-                    pdf_uploaded_at=pdf_uploaded_at,
+                    pdf_uploaded_at=uploaded_at,
                     status="COMPLETED",
                 )
             )
-            session.add(
-                DMSArtifact(
-                    case_id=case_id,
-                    dms_document_id=pdf_doc_id,
-                    artifact_type="PDF_REPORT",
-                    direction="OUTBOUND",
-                    status="SUCCESS",
-                )
-            )
+            session.add(DMSArtifact(
+                case_id=case_id,
+                dms_document_id=pdf_doc_id,
+                artifact_type="PDF_REPORT",
+                direction="OUTBOUND",
+                status="SUCCESS",
+            ))
             await self._audit(
                 session, case_id, event.application_id, "REPORT_UPLOADED",
                 {"pdf_dms_document_id": pdf_doc_id}, actor=_ACTOR,
@@ -654,6 +619,7 @@ class ApplicationProcessor:
     async def _export_to_edw(
         self, event: ApplicationEvent, case_id: UUID, case_result: CaseResult
     ) -> None:
+        rec_str = str(case_result.recommendation)
         payload = {
             "application_id": event.application_id,
             "event_id": str(event.event_id),
@@ -662,7 +628,7 @@ class ApplicationProcessor:
             "validator_id": event.validator_id,
             "supervisor_id": event.supervisor_id,
             "applicant_data": event.applicant_data,
-            "recommendation": str(case_result.recommendation),
+            "recommendation": rec_str,
             "recommendation_rationale": case_result.recommendation_rationale,
             "manual_review_required": case_result.manual_review_required,
             "validation_results": [
@@ -692,9 +658,13 @@ class ApplicationProcessor:
                 timeout=_TIMEOUT_EDW_EXPORT,
             )
         except Exception as exc:
-            log.error("edw.export_failed", application_id=event.application_id, error=str(exc))
-            # EDW failure does NOT mark the case FAILED — business processing completed.
-            # The edw_staging row stays for independent retry.
+            log.error(
+                "edw.export_failed",
+                application_id=event.application_id,
+                error=str(exc),
+            )
+            # EDW failure does NOT mark the case FAILED — business processing
+            # completed. The edw_staging row stays for independent retry.
             async with AsyncSessionLocal() as session:
                 await session.execute(
                     update(EDWStaging).where(EDWStaging.id == staging_id).values(
@@ -722,19 +692,12 @@ class ApplicationProcessor:
             )
             await self._audit(
                 session, case_id, event.application_id, "CASE_COMPLETED",
-                {
-                    "recommendation": str(case_result.recommendation),
-                    "edw_confirmation_id": confirmation_id,
-                },
+                {"recommendation": rec_str, "edw_confirmation_id": confirmation_id},
                 actor=_ACTOR,
             )
             await session.commit()
 
-        log.info(
-            "case.completed",
-            application_id=event.application_id,
-            recommendation=str(case_result.recommendation),
-        )
+        log.info("case.completed", application_id=event.application_id, recommendation=rec_str)
 
     # ------------------------------------------------------------------ #
     #  Retry wrapper with processing_job tracking                           #
@@ -744,11 +707,11 @@ class ApplicationProcessor:
         self,
         case_id: UUID,
         job_type: str,
-        coro_fn,
+        coro_fn: Callable[[], Awaitable[T]],
         timeout: float,
         max_attempts: int = _MAX_ATTEMPTS,
         base_delay: float = _RETRY_BASE_DELAY,
-    ):
+    ) -> T:
         async with AsyncSessionLocal() as session:
             job = ProcessingJob(
                 case_id=case_id,
@@ -780,7 +743,6 @@ class ApplicationProcessor:
             except Exception as exc:
                 last_exc = exc
                 is_last = attempt == max_attempts
-                job_status = "FAILED" if is_last else "RETRYING"
                 log.warning(
                     "job.attempt_failed",
                     job_type=job_type,
@@ -791,7 +753,7 @@ class ApplicationProcessor:
                 async with AsyncSessionLocal() as session:
                     await session.execute(
                         update(ProcessingJob).where(ProcessingJob.id == job_id).values(
-                            status=job_status,
+                            status="FAILED" if is_last else "RETRYING",
                             attempt_count=attempt,
                             last_error=str(exc),
                             last_attempted_at=datetime.now(timezone.utc),
@@ -816,15 +778,13 @@ class ApplicationProcessor:
         detail: dict | None = None,
         actor: str = _ACTOR,
     ) -> None:
-        session.add(
-            AuditEvent(
-                case_id=case_id,
-                application_id=application_id,
-                event_type=event_type,
-                actor=actor,
-                detail=detail,
-            )
-        )
+        session.add(AuditEvent(
+            case_id=case_id,
+            application_id=application_id,
+            event_type=event_type,
+            actor=actor,
+            detail=detail,
+        ))
 
     async def _dead_letter(
         self,
@@ -843,15 +803,13 @@ class ApplicationProcessor:
             error=error,
         )
         async with AsyncSessionLocal() as session:
-            session.add(
-                DeadLetterEvent(
-                    event_id=UUID(str(event_id)) if event_id else None,
-                    case_id=UUID(str(case_id)) if case_id else None,
-                    application_id=application_id,
-                    reason_code=reason_code,
-                    error_detail=error,
-                    raw_payload=raw_payload,
-                    stack_trace=stack_trace,
-                )
-            )
+            session.add(DeadLetterEvent(
+                event_id=UUID(str(event_id)) if event_id else None,
+                case_id=UUID(str(case_id)) if case_id else None,
+                application_id=application_id,
+                reason_code=reason_code,
+                error_detail=error,
+                raw_payload=raw_payload,
+                stack_trace=stack_trace,
+            ))
             await session.commit()
