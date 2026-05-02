@@ -43,16 +43,25 @@ class ApplicationCase(Base):
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
     application_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    event_id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), nullable=False)
+    # FK to the deduplication key on inbound_application_event (UNIQUE column).
+    event_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True),
+        ForeignKey("inbound_application_event.event_id", name="fk_application_case_event_id"),
+        nullable=False,
+    )
     product_type: Mapped[str] = mapped_column(String(50), nullable=False)
     branch_name: Mapped[str] = mapped_column(String(200), nullable=False)
     validator_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     supervisor_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     applicant_data: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="RECEIVED")
+    status: Mapped[str] = mapped_column(String(50), nullable=False, default="CREATED")
     recommendation: Mapped[str | None] = mapped_column(String(20), nullable=True)
     recommendation_rationale: Mapped[str | None] = mapped_column(Text, nullable=True)
     manual_review_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Captures top-level pipeline failures that are not attributable to a
+    # specific stage row (handler exceptions, missing required documents,
+    # unsupported product type after the case row was created, etc.).
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -104,6 +113,7 @@ class CaseDocument(Base):
     verification_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -153,8 +163,6 @@ class ValidationResultRow(Base):
     field_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     extracted_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     expected_value: Mapped[str | None] = mapped_column(Text, nullable=True)
-    input_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     manual_review_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     evaluated_at: Mapped[datetime] = mapped_column(
@@ -180,6 +188,7 @@ class CaseReport(Base):
     pdf_generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     pdf_uploaded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="PENDING")
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -263,8 +272,14 @@ class DeadLetterEvent(Base):
     __tablename__ = "dead_letter_event"
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    # FK to inbound_application_event.event_id (UNIQUE column).
+    # Nullable: events that fail schema validation never produce an
+    # inbound_application_event row, so there is nothing to reference.
     event_id: Mapped[UUID | None] = mapped_column(
-        PGUUID(as_uuid=True), nullable=True, index=True
+        PGUUID(as_uuid=True),
+        ForeignKey("inbound_application_event.event_id", name="fk_dead_letter_event_id"),
+        nullable=True,
+        index=True,
     )
     case_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("application_case.id"), nullable=True, index=True
@@ -281,9 +296,21 @@ class DeadLetterEvent(Base):
 
 
 class AuditEvent(Base):
+    """Immutable audit log. Range-partitioned by `occurred_at` (monthly).
+
+    The table is declared partitioned in the migration. The PK is a composite
+    (id, occurred_at) so the partition key can participate.
+    """
+
     __tablename__ = "audit_event"
 
     id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        primary_key=True,
+        server_default=func.now(),
+        index=True,
+    )
     case_id: Mapped[UUID | None] = mapped_column(
         ForeignKey("application_case.id"), nullable=True, index=True
     )
@@ -291,10 +318,12 @@ class AuditEvent(Base):
     event_type: Mapped[str] = mapped_column(String(100), nullable=False)
     actor: Mapped[str | None] = mapped_column(String(100), nullable=True)
     detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    occurred_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), index=True
-    )
 
     case: Mapped["ApplicationCase | None"] = relationship(back_populates="audit_events")
 
-    __table_args__ = (Index("ix_audit_event_case_time", "case_id", "occurred_at"),)
+    __table_args__ = (
+        Index("ix_audit_event_case_time", "case_id", "occurred_at"),
+        # Partitioning is declared in the alembic migration.
+        # SQLAlchemy is told here only about the composite PK.
+        {"postgresql_partition_by": "RANGE (occurred_at)"},
+    )

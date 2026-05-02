@@ -1,246 +1,531 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
+import { apiGet, apiBlob } from '../api'
 
-const props = defineProps<{
-  caseId: string
-}>()
+interface ExtractedField { label: string; value: any; confidence: number | null; page_reference: number | null }
+interface Doc {
+  id: string
+  dms_document_id: string
+  document_name: string | null
+  document_type: string | null
+  status: string
+  verification_passed: boolean | null
+  verification_confidence: number | null
+  fetched_at: string | null
+  verified_at: string | null
+  error_detail: string | null
+  extracted_fields: ExtractedField[]
+}
+interface ValidationItem {
+  id: string; rule_code: string; outcome: string; description: string;
+  field_name: string | null; extracted_value: string | null;
+  expected_value: string | null; confidence: number | null;
+  manual_review_required: boolean; evaluated_at: string;
+}
+interface Validations {
+  hard_breach: ValidationItem[]
+  soft_mismatch: ValidationItem[]
+  low_confidence: ValidationItem[]
+  manual_review: ValidationItem[]
+}
+interface AuditEntry { id: string; event_type: string; actor: string | null; detail: any; occurred_at: string }
+interface Report { status: string | null; pdf_available: boolean; pdf_uploaded_at: string | null; error_detail: string | null }
+interface EDW { status: string | null; edw_confirmation_id: string | null; exported_at: string | null; export_error: string | null }
+interface CaseDetail {
+  case: any
+  documents: Doc[]
+  validations: Validations
+  report: Report
+  edw: EDW
+  audit_timeline: AuditEntry[]
+}
 
-const emit = defineEmits<{
-  (e: 'close'): void
-}>()
+const props = defineProps<{ caseId: string }>()
+const emit = defineEmits<{ (e: 'close'): void }>()
 
-const caseData = ref<any>(null)
+const data = ref<CaseDetail | null>(null)
 const loading = ref(true)
+const error = ref<string | null>(null)
+const activeTab = ref<'overview' | 'documents' | 'validations' | 'timeline'>('overview')
+
+const validationCount = computed(() => {
+  if (!data.value) return 0
+  const v = data.value.validations
+  return v.hard_breach.length + v.soft_mismatch.length + v.low_confidence.length + v.manual_review.length
+})
 
 onMounted(async () => {
   try {
-    const res = await fetch(`/api/cases/${props.caseId}`)
-    caseData.value = await res.json()
-  } catch (e) {
-    console.error(e)
+    data.value = await apiGet<CaseDetail>(`/api/v1/cases/${props.caseId}`)
+  } catch (e: any) {
+    error.value = e.message || 'Failed to load case.'
   } finally {
     loading.value = false
   }
 })
 
-const getOutcomeClass = (outcome: string) => {
-  if (outcome === 'HARD_BREACH') return 'badge-danger'
-  if (outcome === 'SOFT_MISMATCH') return 'badge-warning'
-  if (outcome === 'LOW_CONFIDENCE') return 'badge-warning'
-  return 'badge-success'
+async function downloadReport() {
+  try {
+    const blob = await apiBlob(`/api/v1/cases/${props.caseId}/report`)
+    const url = URL.createObjectURL(blob)
+    window.open(url, '_blank')
+    setTimeout(() => URL.revokeObjectURL(url), 60_000)
+  } catch (e: any) {
+    error.value = e.message || 'Failed to download report.'
+  }
 }
 
-const downloadReport = async () => {
-  const res = await fetch(`/api/cases/${props.caseId}/report`)
-  const blob = await res.blob()
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = `report_${props.caseId}.pdf`
-  a.click()
-  URL.revokeObjectURL(url)
+function recChipClass(r: string | null) {
+  if (r === 'APPROVE') return 'chip-success'
+  if (r === 'HOLD') return 'chip-warning'
+  if (r === 'DECLINE') return 'chip-danger'
+  return 'chip-neutral'
+}
+function statusChipClass(s: string | null) {
+  if (!s) return 'chip-neutral'
+  if (s === 'COMPLETED') return 'chip-success'
+  if (s === 'FAILED') return 'chip-danger'
+  if (s === 'MANUAL_INTERVENTION_REQUIRED') return 'chip-amber'
+  return 'chip-info'
+}
+function reportChip(s: string | null) {
+  if (!s) return 'chip-neutral'
+  if (s === 'UPLOADED') return 'chip-success'
+  if (s === 'FAILED') return 'chip-danger'
+  return 'chip-info'
+}
+function edwChip(s: string | null) {
+  if (!s) return 'chip-neutral'
+  if (s === 'EXPORTED') return 'chip-success'
+  if (s === 'EXPORT_FAILED') return 'chip-danger'
+  return 'chip-info'
+}
+function outcomeChip(o: string) {
+  if (o === 'HARD_BREACH') return 'chip-danger'
+  if (o === 'SOFT_MISMATCH') return 'chip-warning'
+  if (o === 'LOW_CONFIDENCE') return 'chip-info'
+  if (o === 'MANUAL_REVIEW_REQUIRED') return 'chip-amber'
+  return 'chip-neutral'
+}
+function fmtDateTime(iso: string | null) {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  })
+}
+function confKlass(c: number | null) {
+  if (c == null) return ''
+  if (c < 0.6) return 'danger'
+  if (c < 0.8) return 'warn'
+  return ''
+}
+function tlClass(eventType: string) {
+  if (eventType.includes('FAILED') || eventType === 'CASE_FAILED' || eventType === 'DOCUMENT_TYPE_MISMATCH') return 'tl-danger'
+  if (eventType === 'MISSING_REQUIRED_DOCUMENTS') return 'tl-warning'
+  if (eventType === 'CASE_COMPLETED' || eventType === 'EDW_EXPORTED' || eventType === 'REPORT_UPLOADED') return 'tl-success'
+  return ''
+}
+function eventTitle(t: string) {
+  return t.replaceAll('_', ' ').toLowerCase().replace(/^./, c => c.toUpperCase())
+}
+function detailString(d: any): string {
+  if (!d) return ''
+  if (typeof d === 'string') return d
+  return JSON.stringify(d, null, 2)
 }
 </script>
 
 <template>
-  <div class="modal-overlay" @click.self="emit('close')">
-    <div class="modal-content glass case-details-modal">
-      <div class="modal-header">
-        <h3>Case Details</h3>
-        <div class="header-actions">
-          <button
-            v-if="caseData?.report?.pdf_available"
-            class="btn btn-primary btn-sm"
-            @click="downloadReport"
-          >
-            ↓ Download PDF Report
-          </button>
-          <span
-            v-else-if="caseData && !loading"
-            class="report-unavailable"
-          >
-            Report not yet available
-          </span>
-          <button class="close-btn" @click="emit('close')">&times;</button>
+  <div class="drawer-backdrop" @click="emit('close')"></div>
+  <aside class="drawer" role="dialog" aria-label="Case details">
+    <header class="drawer-header">
+      <div class="row gap-12" style="min-width: 0;">
+        <button class="btn btn-icon btn-ghost" @click="emit('close')" title="Close">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+        <div style="min-width: 0;">
+          <div class="drawer-eyebrow muted">Application</div>
+          <div class="drawer-title mono truncate">{{ data?.case?.application_id ?? caseId }}</div>
         </div>
       </div>
-      
-      <div class="modal-body" v-if="loading">
-        Loading case details...
+      <div class="row gap-12">
+        <button
+          class="btn btn-soft btn-sm"
+          :disabled="!data?.report?.pdf_available"
+          @click="downloadReport"
+          :title="data?.report?.pdf_available ? 'Open the PDF report' : 'Report not yet uploaded'"
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M7 10l5 5 5-5"/><path d="M12 15V3"/></svg>
+          PDF Report
+        </button>
       </div>
-      
-      <div class="modal-body" v-else-if="caseData && !caseData.error">
-        <div class="section">
-          <h4>Overview</h4>
-          <div class="info-grid">
-            <div><strong>Application ID:</strong> {{ caseData.case.application_id }}</div>
-            <div><strong>Status:</strong> {{ caseData.case.status }}</div>
-            <div><strong>Recommendation:</strong> {{ caseData.case.recommendation || 'PENDING' }}</div>
+    </header>
+
+    <div class="drawer-body">
+      <!-- Loading -->
+      <div v-if="loading">
+        <div class="skeleton sk-line" style="width: 40%; height: 24px;"></div>
+        <div class="skeleton sk-line" style="width: 75%; margin-top: 14px;"></div>
+        <div class="skeleton sk-row" style="margin-top: 18px;"></div>
+        <div class="skeleton sk-row" style="margin-top: 8px;"></div>
+      </div>
+
+      <!-- Error -->
+      <div v-else-if="error" class="alert alert-danger">
+        <div>
+          <div class="alert-title">Could not load this case.</div>
+          <div class="mono" style="margin-top: 4px;">{{ error }}</div>
+        </div>
+      </div>
+
+      <template v-else-if="data">
+        <!-- Hero card -->
+        <section class="hero panel panel-pad">
+          <div class="hero-top">
+            <div class="hero-applicant">
+              <div class="hero-eyebrow muted">Applicant</div>
+              <div class="hero-name">{{ data.case.applicant_name ?? '—' }}</div>
+              <div class="hero-meta muted">
+                <span class="mono">{{ data.case.applicant_data?.id_number ?? '' }}</span>
+                <span v-if="data.case.applicant_data?.employer">· {{ data.case.applicant_data.employer }}</span>
+              </div>
+            </div>
+
+            <div class="hero-rec">
+              <div class="hero-eyebrow muted" style="text-align: right;">Recommendation</div>
+              <span
+                v-if="data.case.recommendation"
+                class="big-rec"
+                :class="recChipClass(data.case.recommendation)"
+              >{{ data.case.recommendation }}</span>
+              <span v-else class="big-rec chip-neutral">PENDING</span>
+              <div v-if="data.case.recommendation_rationale" class="hero-rationale muted">
+                {{ data.case.recommendation_rationale }}
+              </div>
+            </div>
+          </div>
+
+          <div class="hero-status-row">
+            <div class="status-pill">
+              <span class="muted">Status</span>
+              <span class="chip chip-dot" :class="statusChipClass(data.case.status)">
+                {{ data.case.status === 'MANUAL_INTERVENTION_REQUIRED' ? 'NEEDS REVIEW' : data.case.status.replaceAll('_', ' ') }}
+              </span>
+            </div>
+            <div class="status-pill">
+              <span class="muted">Report</span>
+              <span class="chip" :class="reportChip(data.report.status)">{{ data.report.status ?? 'PENDING' }}</span>
+            </div>
+            <div class="status-pill">
+              <span class="muted">EDW</span>
+              <span class="chip" :class="edwChip(data.edw.status)">{{ data.edw.status ?? '—' }}</span>
+            </div>
+            <div class="status-pill">
+              <span class="muted">Submitted</span>
+              <span class="mono">{{ fmtDateTime(data.case.created_at) }}</span>
+            </div>
+            <div v-if="data.case.completed_at" class="status-pill">
+              <span class="muted">Completed</span>
+              <span class="mono">{{ fmtDateTime(data.case.completed_at) }}</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Error banners -->
+        <div class="banners">
+          <div v-if="data.case.error_detail" class="alert alert-danger">
+            <div>
+              <div class="alert-title">Pipeline error</div>
+              <div class="mono" style="margin-top: 4px;">{{ data.case.error_detail }}</div>
+            </div>
+          </div>
+          <div v-if="data.report.status === 'FAILED' && data.report.error_detail" class="alert alert-warning">
+            <div>
+              <div class="alert-title">Report delivery failed</div>
+              <div class="mono" style="margin-top: 4px;">{{ data.report.error_detail }}</div>
+            </div>
+          </div>
+          <div v-if="data.edw.status === 'EXPORT_FAILED' && data.edw.export_error" class="alert alert-warning">
+            <div>
+              <div class="alert-title">EDW export failed</div>
+              <div class="mono" style="margin-top: 4px;">{{ data.edw.export_error }}</div>
+            </div>
           </div>
         </div>
 
-        <div class="section">
-          <h4>Documents Processed</h4>
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Name</th>
-                <th>Type</th>
-                <th>Status</th>
-                <th>Verified</th>
-                <th>Confidence</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="doc in caseData.documents" :key="doc.id">
-                <td>{{ doc.document_name || doc.dms_document_id }}</td>
-                <td>{{ doc.document_type }}</td>
-                <td>{{ doc.status }}</td>
-                <td>
-                  <span v-if="doc.verification_passed === true" class="badge badge-success">✓ PASS</span>
-                  <span v-else-if="doc.verification_passed === false" class="badge badge-danger">✗ FAIL</span>
-                  <span v-else class="text-secondary">-</span>
-                </td>
-                <td>{{ doc.verification_confidence != null ? (doc.verification_confidence * 100).toFixed(0) + '%' : '-' }}</td>
-              </tr>
-            </tbody>
-          </table>
+        <!-- Tabs -->
+        <div class="tabs">
+          <button class="tab" :class="{ 'is-active': activeTab === 'overview' }" @click="activeTab = 'overview'">Overview</button>
+          <button class="tab" :class="{ 'is-active': activeTab === 'documents' }" @click="activeTab = 'documents'">
+            Documents
+            <span class="tab-count">{{ data.documents.length }}</span>
+          </button>
+          <button class="tab" :class="{ 'is-active': activeTab === 'validations' }" @click="activeTab = 'validations'">
+            Validations
+            <span class="tab-count">{{ validationCount }}</span>
+          </button>
+          <button class="tab" :class="{ 'is-active': activeTab === 'timeline' }" @click="activeTab = 'timeline'">
+            Timeline
+            <span class="tab-count">{{ data.audit_timeline.length }}</span>
+          </button>
         </div>
 
-        <div class="section">
-          <h4>Validation Results</h4>
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Rule</th>
-                <th>Outcome</th>
-                <th>Field</th>
-                <th>Extracted</th>
-                <th>Expected</th>
-                <th>Description</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="val in caseData.validations" :key="val.id">
-                <td><code>{{ val.rule_code }}</code></td>
-                <td>
-                  <span class="badge" :class="getOutcomeClass(val.outcome)">{{ val.outcome }}</span>
-                </td>
-                <td class="text-sm">{{ val.field_name || '-' }}</td>
-                <td class="text-sm">{{ val.extracted_value || '-' }}</td>
-                <td class="text-sm">{{ val.expected_value || '-' }}</td>
-                <td class="text-sm desc-cell">{{ val.description }}</td>
-              </tr>
-              <tr v-if="caseData.validations.length === 0">
-                <td colspan="6" class="text-secondary text-center py-4">No validations run yet.</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-      
-      <div class="modal-body" v-else>
-        <p class="text-danger">Failed to load case details.</p>
-      </div>
+        <!-- OVERVIEW -->
+        <section v-if="activeTab === 'overview'" class="panel panel-pad">
+          <div class="section-title">Applicant Snapshot</div>
+          <dl class="kv">
+            <template v-for="(v, k) in (data.case.applicant_data || {})" :key="k">
+              <dt class="muted">{{ String(k).replaceAll('_', ' ') }}</dt>
+              <dd>{{ v ?? '—' }}</dd>
+            </template>
+          </dl>
+
+          <div class="divider"></div>
+
+          <div class="section-title">Pipeline Routing</div>
+          <dl class="kv">
+            <dt class="muted">Validator</dt><dd class="mono">{{ data.case.validator_id }}</dd>
+            <dt class="muted">Supervisor</dt><dd class="mono">{{ data.case.supervisor_id }}</dd>
+            <dt class="muted">Branch</dt><dd>{{ data.case.branch_name }}</dd>
+            <dt class="muted">Product</dt><dd>{{ data.case.product_type.replaceAll('_', ' ') }}</dd>
+          </dl>
+        </section>
+
+        <!-- DOCUMENTS -->
+        <section v-else-if="activeTab === 'documents'" class="panel panel-pad" style="padding: 0;">
+          <div v-if="data.documents.length === 0" class="empty-mini">No documents recorded.</div>
+          <article v-for="d in data.documents" :key="d.id" class="doc">
+            <header class="doc-head">
+              <div>
+                <div class="doc-name">{{ d.document_name || d.dms_document_id }}</div>
+                <div class="muted mono" style="font-size: 12px;">
+                  {{ d.dms_document_id }} · {{ d.document_type ?? 'unknown type' }}
+                </div>
+              </div>
+              <div class="doc-status">
+                <span v-if="d.verification_passed === true" class="chip chip-success chip-dot">VERIFIED</span>
+                <span v-else-if="d.verification_passed === false" class="chip chip-danger chip-dot">MISMATCH</span>
+                <span v-else class="chip chip-neutral">{{ d.status }}</span>
+                <span v-if="d.verification_confidence != null" class="confbar">
+                  <span class="confbar-track">
+                    <span
+                      class="confbar-fill"
+                      :class="confKlass(d.verification_confidence)"
+                      :style="{ width: (d.verification_confidence * 100).toFixed(0) + '%' }"
+                    ></span>
+                  </span>
+                  <span class="muted" style="font-size: 12px;">{{ (d.verification_confidence * 100).toFixed(0) }}%</span>
+                </span>
+              </div>
+            </header>
+
+            <div v-if="d.error_detail" class="alert alert-danger" style="margin: 4px 0 12px;">
+              <div>
+                <div class="alert-title">Document error</div>
+                <div class="mono" style="margin-top: 4px;">{{ d.error_detail }}</div>
+              </div>
+            </div>
+
+            <div v-if="d.extracted_fields.length > 0" class="doc-fields">
+              <div class="doc-fields-head">Extracted Fields</div>
+              <table class="table mini">
+                <thead>
+                  <tr>
+                    <th style="width: 35%;">Field</th>
+                    <th>Value</th>
+                    <th style="width: 140px;">Confidence</th>
+                    <th style="width: 60px;">Page</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="f in d.extracted_fields" :key="f.label">
+                    <td>{{ f.label }}</td>
+                    <td class="mono">{{ f.value ?? '—' }}</td>
+                    <td>
+                      <span v-if="f.confidence != null" class="confbar">
+                        <span class="confbar-track">
+                          <span
+                            class="confbar-fill"
+                            :class="confKlass(f.confidence)"
+                            :style="{ width: (f.confidence * 100).toFixed(0) + '%' }"
+                          ></span>
+                        </span>
+                        <span class="muted" style="font-size: 12px;">{{ (f.confidence * 100).toFixed(0) }}%</span>
+                      </span>
+                      <span v-else class="muted">—</span>
+                    </td>
+                    <td class="muted">{{ f.page_reference ?? '—' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div v-else class="empty-mini">No extracted fields recorded for this document.</div>
+          </article>
+        </section>
+
+        <!-- VALIDATIONS -->
+        <section v-else-if="activeTab === 'validations'" class="panel panel-pad">
+          <div v-if="validationCount === 0" class="empty-mini">No validation rows produced for this case.</div>
+
+          <template v-else>
+            <div v-for="g in [
+              { key: 'hard_breach', title: 'Hard breaches', items: data.validations.hard_breach },
+              { key: 'soft_mismatch', title: 'Soft mismatches', items: data.validations.soft_mismatch },
+              { key: 'low_confidence', title: 'Low-confidence extractions', items: data.validations.low_confidence },
+              { key: 'manual_review', title: 'Manual review required', items: data.validations.manual_review },
+            ]" :key="g.key">
+              <div v-if="g.items.length > 0" class="val-group">
+                <div class="val-group-title">
+                  <span>{{ g.title }}</span>
+                  <span class="chip chip-neutral">{{ g.items.length }}</span>
+                </div>
+                <div v-for="v in g.items" :key="v.id" class="val-item">
+                  <div class="val-item-head">
+                    <span class="chip" :class="outcomeChip(v.outcome)">{{ v.outcome.replaceAll('_', ' ') }}</span>
+                    <span class="mono">{{ v.rule_code }}</span>
+                    <span v-if="v.field_name" class="muted" style="font-size: 12px;">on {{ v.field_name }}</span>
+                  </div>
+                  <div class="val-item-desc">{{ v.description }}</div>
+                  <div v-if="v.extracted_value || v.expected_value" class="val-item-cmp">
+                    <div>
+                      <span class="muted">Extracted:</span>
+                      <span class="mono">{{ v.extracted_value ?? '—' }}</span>
+                    </div>
+                    <div>
+                      <span class="muted">Expected:</span>
+                      <span class="mono">{{ v.expected_value ?? '—' }}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+        </section>
+
+        <!-- TIMELINE -->
+        <section v-else-if="activeTab === 'timeline'" class="panel panel-pad">
+          <div v-if="data.audit_timeline.length === 0" class="empty-mini">No audit events recorded yet.</div>
+          <ol v-else class="timeline">
+            <li v-for="a in data.audit_timeline" :key="a.id" class="tl-item" :class="tlClass(a.event_type)">
+              <div class="tl-time">{{ fmtDateTime(a.occurred_at) }}</div>
+              <div class="tl-title">{{ eventTitle(a.event_type) }}</div>
+              <div v-if="a.actor" class="muted" style="font-size: 11px; margin-top: 2px;">by {{ a.actor }}</div>
+              <pre v-if="a.detail" class="tl-detail">{{ detailString(a.detail) }}</pre>
+            </li>
+          </ol>
+        </section>
+      </template>
     </div>
-  </div>
+  </aside>
 </template>
 
 <style scoped>
-.case-details-modal {
-  max-width: 800px;
+.drawer-eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.drawer-title { font-size: 16px; font-weight: 600; margin-top: 2px; }
+
+.hero { margin-bottom: 16px; }
+.hero-top {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 16px;
 }
-.modal-content {
-  display: flex;
-  flex-direction: column;
+.hero-eyebrow { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.hero-name { font-size: 22px; font-weight: 600; margin-top: 2px; }
+.hero-meta { font-size: 12px; margin-top: 4px; }
+
+.hero-rec { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; max-width: 50%; }
+.big-rec {
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: .04em;
+  padding: 6px 16px;
+  border-radius: var(--r-md);
 }
-.modal-header {
-  padding: 1.5rem;
-  border-bottom: 1px solid var(--surface-border);
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
+.hero-rationale { font-size: 12px; max-width: 360px; text-align: right; line-height: 1.45; }
+
+.hero-status-row {
+  display: flex; flex-wrap: wrap; gap: 12px 22px;
+  margin-top: 18px; padding-top: 16px;
+  border-top: 1px solid var(--border);
 }
-.modal-header h3 {
-  margin: 0;
-  font-size: 1.25rem;
+.status-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px;
 }
-.header-actions {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-.report-unavailable {
-  font-size: 0.8rem;
-  color: var(--text-secondary);
-  font-style: italic;
-}
-.close-btn {
-  background: none;
-  border: none;
-  color: var(--text-secondary);
-  font-size: 1.5rem;
-  cursor: pointer;
-}
-.close-btn:hover {
-  color: white;
-}
-.modal-body {
-  padding: 1.5rem;
-}
-.section {
-  margin-bottom: 2rem;
-}
-.section h4 {
-  margin-bottom: 1rem;
-  font-size: 1.1rem;
-  color: var(--primary);
-}
-.info-grid {
+.status-pill .muted { font-size: 11px; }
+
+.banners { display: flex; flex-direction: column; gap: 10px; margin: 14px 0 18px; }
+
+/* key/value */
+.kv {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 1rem;
-  background: rgba(0, 0, 0, 0.2);
-  padding: 1rem;
-  border-radius: 8px;
+  grid-template-columns: 160px 1fr;
+  gap: 8px 16px;
+  font-size: 13px;
 }
-.data-table {
-  width: 100%;
-  border-collapse: collapse;
-  background: rgba(0, 0, 0, 0.2);
-  border-radius: 8px;
-  overflow: hidden;
+.kv dt { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding-top: 2px; }
+.kv dd { margin: 0; word-break: break-word; }
+
+.empty-mini {
+  padding: 24px; text-align: center; color: var(--text-3); font-size: 13px;
 }
-.data-table th, .data-table td {
-  padding: 0.75rem 1rem;
-  text-align: left;
-  border-bottom: 1px solid var(--surface-border);
+
+/* documents */
+.doc { padding: 18px 20px; border-bottom: 1px solid var(--border); }
+.doc:last-child { border-bottom: none; }
+.doc-head {
+  display: flex; justify-content: space-between; align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
 }
-.data-table th {
-  background: rgba(0, 0, 0, 0.3);
-  font-size: 0.75rem;
+.doc-name { font-weight: 600; font-size: 14px; }
+.doc-status { display: flex; gap: 12px; align-items: center; }
+
+.doc-fields-head {
+  font-size: 11px;
   text-transform: uppercase;
-  color: var(--text-secondary);
+  letter-spacing: .06em;
+  color: var(--text-3);
+  margin-bottom: 6px;
 }
-.text-sm {
-  font-size: 0.875rem;
+.table.mini th, .table.mini td { padding: 8px 12px; font-size: 12.5px; }
+.table.mini { background: var(--bg-soft); border-radius: var(--r-md); overflow: hidden; }
+
+/* validations */
+.val-group { margin-bottom: 18px; }
+.val-group-title {
+  display: flex; gap: 10px; align-items: center;
+  font-size: 13px; font-weight: 600;
+  margin-bottom: 10px;
+  color: var(--text-2);
 }
-pre {
-  margin: 0;
-  white-space: pre-wrap;
-  font-family: monospace;
+.val-item {
+  border: 1px solid var(--border);
+  background: var(--bg-soft);
+  border-radius: var(--r-md);
+  padding: 12px 14px;
+  margin-bottom: 8px;
 }
-.text-secondary {
-  color: var(--text-secondary);
+.val-item-head { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
+.val-item-desc { font-size: 13px; color: var(--text-2); }
+.val-item-cmp {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 16px;
+  margin-top: 8px;
+  font-size: 12px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
 }
-.text-center {
-  text-align: center;
-}
-.py-4 {
-  padding-top: 1rem;
-  padding-bottom: 1rem;
-}
-.text-danger {
-  color: var(--danger);
+.val-item-cmp .muted { margin-right: 6px; font-size: 11px; }
+
+@media (max-width: 720px) {
+  .hero-top { flex-direction: column; }
+  .hero-rec { align-items: flex-start; max-width: 100%; }
+  .hero-rationale { text-align: left; }
+  .doc-head { flex-direction: column; }
+  .doc-status { align-items: flex-start; }
+  .kv { grid-template-columns: 1fr; }
+  .val-item-cmp { grid-template-columns: 1fr; }
 }
 </style>

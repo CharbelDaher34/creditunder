@@ -60,7 +60,7 @@ The platform is built on four fixed pillars:
 | **EDW** | Alinma's Enterprise Data Warehouse — an existing company-wide system. Receives the settled final output in a single write per case. EDW does not support mid-pipeline queries; all data is staged in Postgres first and written to EDW atomically at the end. |
 | **DMS** | Document Management System. Source of application documents; destination for the final PDF report. |
 | **Report Generator** | In-process service. Calls AI Service for narrative text, assembles the report in HTML (for full layout control), stores the HTML in Postgres, converts to PDF via headless browser, and writes the PDF to DMS. |
-| **Observability and Audit** | All telemetry is emitted via the OpenTelemetry (OTel) SDK and exported to an OTel-compatible backend. Captures structured logs (OTel Logs / OTLP), distributed traces (OTel Tracing), and metrics (OTel Metrics). Immutable business audit records are additionally written to Postgres (`audit_event`) for long-term queryable history independent of the observability platform's retention window. |
+| **Observability and Audit** | All telemetry is to be emitted via the OpenTelemetry (OTel) SDK and exported to an OTel-compatible backend. The wrapping client lives in `src/creditunder/otel_observability.py` (class `Telemetry`) and exposes the standard span/counter/histogram surface. The class is currently scaffolding-only — it is not yet wired into the pipeline. Until then, runtime logging is handled by `structlog` (JSON to stdout + rotating file). Immutable business audit records are written to Postgres (`audit_event`) for long-term queryable history independent of the observability platform's retention window. |
 | **Validator / Supervisor** | Human bank staff. Validators review cases assigned to them. Supervisors review all cases under their team. Both interact only through the internal UI (described in Section 12) and through Siebel CRM — they have no direct interaction with this system's API or database. |
 
 ---
@@ -317,10 +317,10 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `id` | UUID PK | |
 | `event_id` | UUID UNIQUE NOT NULL | Deduplication key — checked at consumption time |
 | `application_id` | string NOT NULL | Business key from CRM |
-| `product_type` | string NOT NULL | |
+| `product_type` | string | Resolved from the event payload at ingest |
 | `raw_payload` | JSONB NOT NULL | Full Kafka message stored for replay |
 | `received_at` | timestamptz NOT NULL | |
-| `status` | string NOT NULL | `RECEIVED`, `PROCESSING`, `COMPLETED`, `FAILED` |
+| `status` | string NOT NULL | `RECEIVED` (default) → `PROCESSING` → `COMPLETED` / `FAILED` |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
 
 ---
@@ -335,18 +335,20 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 |---|---|---|
 | `id` | UUID PK | |
 | `application_id` | string UNIQUE NOT NULL | |
-| `event_id` | UUID NOT NULL FK → `inbound_application_event.event_id` | |
+| `event_id` | UUID NOT NULL FK → `inbound_application_event.event_id` | Enforced via `fk_application_case_event_id` |
 | `product_type` | string NOT NULL | |
 | `branch_name` | string NOT NULL | |
 | `validator_id` | string NOT NULL | |
 | `supervisor_id` | string NOT NULL | |
 | `applicant_data` | JSONB NOT NULL | Snapshot from the Kafka event — authoritative for this case |
-| `status` | string NOT NULL | `CREATED`, `IN_PROGRESS`, `COMPLETED`, `FAILED`, `MANUAL_INTERVENTION_REQUIRED` |
+| `status` | string NOT NULL | `CREATED` → `IN_PROGRESS` → `COMPLETED` (or `FAILED` / `MANUAL_INTERVENTION_REQUIRED`). `COMPLETED` means business processing produced a recommendation; delivery state lives on `case_report` and `edw_staging` |
 | `recommendation` | string | `APPROVE`, `HOLD`, `DECLINE` — set after handler completes |
+| `recommendation_rationale` | text | Free-form rationale string emitted alongside the recommendation |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
+| `error_detail` | text | Top-level pipeline failure description. Set whenever `status` is `FAILED` or `MANUAL_INTERVENTION_REQUIRED`. Never silently null on failure — every error path captures here |
 | `created_at` | timestamptz NOT NULL | |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
-| `completed_at` | timestamptz | Set when the full pipeline — including report upload and EDW write — completes |
+| `completed_at` | timestamptz | Set only when **both** the report has been uploaded to DMS **and** the EDW write has been confirmed. Stays NULL if either delivery side fails — the failure is captured on the relevant child row (`case_report.error_detail` / `edw_staging.export_error`) for independent retry |
 
 ---
 
@@ -357,13 +359,14 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `id` | UUID PK | |
 | `case_id` | UUID NOT NULL FK → `application_case` | |
 | `dms_document_id` | string NOT NULL | Source identifier in DMS |
-| `document_type` | string NOT NULL | Resolved from DMS metadata |
-| `file_name` | string | |
-| `status` | string NOT NULL | `FETCHED`, `VERIFIED`, `TYPE_MISMATCH`, `EXTRACTION_COMPLETED`, `EXTRACTION_FAILED`, `VALIDATION_COMPLETED`, `FAILED` |
+| `document_type` | string | Resolved from DMS metadata once the fetch succeeds |
+| `document_name` | string | Filename as reported by DMS |
+| `status` | string NOT NULL | `PENDING` → `FETCHED` → `VERIFIED` / `TYPE_MISMATCH` / `VERIFICATION_FAILED` → `EXTRACTED` / `EXTRACTION_FAILED` → `VALIDATION_COMPLETED` |
 | `verification_result` | string | `MATCH`, `MISMATCH` |
 | `verification_confidence` | float | AI confidence on the type verification call |
 | `fetched_at` | timestamptz | |
 | `verified_at` | timestamptz | |
+| `error_detail` | text | DMS or AI failure description. Set on any `*_FAILED` status; never silent |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
 
 ---
@@ -375,7 +378,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `id` | UUID PK | |
 | `case_document_id` | UUID NOT NULL FK → `case_document` | |
 | `version` | integer NOT NULL | Monotonically increasing per document |
-| `extracted_data` | JSONB NOT NULL | Full typed extraction result (all `ExtractedField` wrappers) |
+| `raw_extraction` | JSONB NOT NULL | Full typed extraction result (all `ExtractedField` wrappers serialised) |
 | `is_valid` | boolean NOT NULL | False if Pydantic schema validation failed |
 | `validation_error` | text | Schema validation error message if `is_valid = false` |
 | `raw_ai_response` | JSONB | Raw AI Service response — retained for diagnostics |
@@ -390,9 +393,11 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `id` | UUID PK | |
 | `case_id` | UUID NOT NULL FK → `application_case` | |
 | `rule_code` | string NOT NULL | Identifies the business rule (e.g. `SALARY_EMPLOYER_MATCH`) |
-| `input_data` | JSONB NOT NULL | Data the rule consumed |
 | `outcome` | string NOT NULL | `HARD_BREACH`, `SOFT_MISMATCH`, `LOW_CONFIDENCE`, `MANUAL_REVIEW_REQUIRED` |
-| `details` | JSONB NOT NULL | Rule-specific output |
+| `description` | text NOT NULL | Human-readable explanation of the outcome (rendered in the report) |
+| `field_name` | string | Field the rule operated on, when applicable |
+| `extracted_value` | text | Value pulled from the document |
+| `expected_value` | text | Value the rule expected (e.g. CRM record) |
 | `confidence` | float | AI confidence, if applicable |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
 | `evaluated_at` | timestamptz NOT NULL | |
@@ -420,12 +425,13 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `id` | UUID PK | |
 | `case_id` | UUID UNIQUE NOT NULL FK → `application_case` | |
 | `html_content` | text | Full assembled HTML report — stored for regeneration without re-running the pipeline |
-| `ai_narrative` | text | The AI-generated narrative text |
+| `narrative` | text | The AI-generated narrative text |
 | `pdf_dms_document_id` | string | DMS identifier of the uploaded PDF — null until upload is confirmed |
 | `html_generated_at` | timestamptz | |
 | `pdf_generated_at` | timestamptz | |
 | `pdf_uploaded_at` | timestamptz | |
-| `status` | string NOT NULL | `PENDING`, `HTML_READY`, `PDF_READY`, `UPLOADED`, `FAILED` |
+| `status` | string NOT NULL | `PENDING` → `HTML_READY` → `PDF_READY` → `UPLOADED`. Any failure (generation or DMS upload) sets `FAILED` with `error_detail` populated |
+| `error_detail` | text | Description of the failure if `status = FAILED`. Cleared on successful re-upload |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
 
 ---
@@ -451,7 +457,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 |---|---|---|
 | `id` | UUID PK | |
 | `case_id` | UUID NOT NULL FK → `application_case` | |
-| `job_type` | string NOT NULL | `DOCUMENT_FETCH`, `VERIFICATION`, `EXTRACTION`, `VALIDATION`, `REPORT_GENERATION`, `EDW_WRITE` |
+| `job_type` | string NOT NULL | `DOCUMENT_FETCH`, `VERIFY_AND_EXTRACT`, `REPORT_GENERATION`, `REPORT_UPLOAD`, `EDW_WRITE` (verification + extraction share one AI call, so they share one job row) |
 | `status` | string NOT NULL | `PENDING`, `IN_PROGRESS`, `COMPLETED`, `FAILED`, `RETRYING` |
 | `attempt_count` | integer NOT NULL DEFAULT 0 | |
 | `max_attempts` | integer NOT NULL | |
@@ -467,11 +473,12 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
-| `source_event_id` | UUID | FK → `inbound_application_event.event_id` if available |
-| `case_id` | UUID | FK → `application_case` if a case was created |
-| `reason_code` | string NOT NULL | e.g. `MAX_RETRIES_EXCEEDED`, `INVALID_EVENT`, `UNSUPPORTED_PRODUCT_TYPE` |
-| `reason_details` | text | Human-readable failure description |
-| `payload_json` | JSONB NOT NULL | Full original payload for deterministic replay |
+| `event_id` | UUID | FK → `inbound_application_event.event_id` (UNIQUE column). NULLable: events that fail schema validation never produce an inbound row |
+| `case_id` | UUID | FK → `application_case.id` if a case was created before failure |
+| `application_id` | string | Business key, when known |
+| `reason_code` | string NOT NULL | e.g. `MAX_RETRIES_EXCEEDED`, `INVALID_EVENT_SCHEMA`, `UNSUPPORTED_PRODUCT_TYPE`, `MISSING_REQUIRED_DOCUMENTS`, `UNHANDLED_PIPELINE_EXCEPTION` |
+| `error_detail` | text | Human-readable failure description |
+| `raw_payload` | JSONB | Full original payload for deterministic replay |
 | `stack_trace` | text | If caused by an unhandled exception |
 | `created_at` | timestamptz NOT NULL | |
 | `replayed_at` | timestamptz | Set when a human operator replays the event |
@@ -484,11 +491,12 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 |---|---|---|
 | `id` | UUID PK | |
 | `case_id` | UUID UNIQUE NOT NULL FK → `application_case` | |
-| `payload_json` | JSONB NOT NULL | Complete final output: extracted data + validations + report metadata |
-| `status` | string NOT NULL | `PENDING`, `EXPORTED`, `EXPORT_FAILED` |
+| `payload` | JSONB NOT NULL | Complete final output: extracted data + validations + report metadata |
+| `status` | string NOT NULL | `STAGED` (default) → `EXPORTED` / `EXPORT_FAILED`. `EXPORT_FAILED` rows are retried independently of the pipeline since `payload` already contains the settled output |
+| `edw_confirmation_id` | string | Identifier returned by EDW on a successful write |
 | `staged_at` | timestamptz NOT NULL | |
 | `exported_at` | timestamptz | |
-| `export_error` | text | |
+| `export_error` | text | Failure description from the most recent EDW write attempt |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
 
 ---
@@ -497,12 +505,13 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 
 | Column | Type | Notes |
 |---|---|---|
-| `id` | UUID PK | |
+| `id` | UUID — part of composite PK with `occurred_at` | |
+| `occurred_at` | timestamptz NOT NULL — part of composite PK; partition key | |
 | `case_id` | UUID FK → `application_case` | |
-| `event_type` | string NOT NULL | e.g. `CASE_CREATED`, `DOCUMENT_FETCHED`, `EXTRACTION_COMPLETED`, `VALIDATION_FAILED`, `REPORT_UPLOADED`, `EDW_EXPORTED` |
-| `actor` | string NOT NULL | System component that generated this event |
-| `details` | JSONB | Event-specific data |
-| `occurred_at` | timestamptz NOT NULL | |
+| `application_id` | string | Business key, denormalised for cross-case queries |
+| `event_type` | string NOT NULL | `CASE_CREATED`, `DOCUMENT_FETCHED`, `EXTRACTION_COMPLETED`, `DOCUMENT_TYPE_MISMATCH`, `VALIDATION_COMPLETED`, `REPORT_UPLOADED`, `EDW_EXPORTED`, `CASE_COMPLETED`, `MISSING_REQUIRED_DOCUMENTS`, `CASE_FAILED` |
+| `actor` | string | System component that generated this event |
+| `detail` | JSONB | Event-specific data |
 
 ---
 
@@ -526,7 +535,12 @@ The following indexes are required for the query patterns in the processing pipe
 
 #### 8.2 Partitioning
 
-`audit_event` grows without bound — one or more rows per stage per case. At 300 events/hour × 8 working hours × ~15 audit rows per case, this table will accumulate approximately **36,000 rows per working day**. Apply **monthly range partitioning on `occurred_at`** from the outset. This bounds query scan times and allows old partitions to be archived without full-table operations as data ages.
+`audit_event` grows without bound — one or more rows per stage per case. At 300 events/hour × 8 working hours × ~15 audit rows per case, this table will accumulate approximately **36,000 rows per working day**. The table is **monthly RANGE-partitioned on `occurred_at`** (PostgreSQL native partitioning). Implementation details:
+
+- The primary key is composite (`id`, `occurred_at`) so the partition key can participate in the PK as required by PostgreSQL.
+- The migration creates partitions covering 2026-01 through ~18 months past the migration date and a `audit_event_default` catch-all so a missing future partition never silently drops audit rows.
+- Indexes (`ix_audit_event_case_id`, `ix_audit_event_occurred_at`, `ix_audit_event_case_time`) are declared on the parent table; PostgreSQL propagates them to all current and future partitions.
+- A scheduled maintenance job (e.g. `pg_partman` or a cron task) must extend the partition window before the last explicit partition fills.
 
 ---
 
@@ -700,6 +714,16 @@ Several failure modes in this system produce no error — they produce a technic
 
 Failures are grouped into three categories: external (DMS, AI Service, Kafka, EDW), business/contract, and internal. All failures are logged with structured fields and written to `audit_event`. Terminal failures go to `dead_letter_event`.
 
+**Terminal-state guarantee.** No error is ever silently swallowed or replaced with a default value. Every failure path captures the error in the most specific `error_detail` column available so the disrupted state is visible to ops:
+
+- Pipeline-level / unhandled exceptions → `application_case.status = FAILED`, `application_case.error_detail` set, plus `dead_letter_event` row with full stack trace.
+- Missing required documents → `application_case.status = MANUAL_INTERVENTION_REQUIRED`, `application_case.error_detail` set, plus `dead_letter_event` row.
+- Per-document failures (DMS fetch, AI verify+extract, unknown document type) → `case_document.status = *_FAILED`, `case_document.error_detail` set; the case continues with whatever documents succeeded so the handler can emit an explicit HARD_BREACH for the missing input rather than the case silently passing.
+- Report generation or upload failure → `case_report.status = FAILED`, `case_report.error_detail` set. `application_case.status` stays `COMPLETED` because business processing is done; `application_case.completed_at` stays NULL until the report is uploaded.
+- EDW export failure → `edw_staging.status = EXPORT_FAILED`, `edw_staging.export_error` set. `application_case.completed_at` stays NULL until the export retry succeeds against the persisted staging payload.
+
+`application_case.completed_at` is set **only** when both delivery sides (report uploaded, EDW exported) have succeeded. A NULL `completed_at` on a `COMPLETED` case is the unambiguous signal that something downstream is unresolved — the specific failure is on the relevant child row.
+
 ---
 
 #### 11.1 External system failures
@@ -738,9 +762,9 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 **Partial document success.** Completed extractions and validations are persisted. Failed documents remain in a retryable state. Case stays open until all required documents are resolved.
 
-**Report HTML assembly failure.** `case_report` marked failed. Case retains its terminal business status and recommendation — report generation failure is separate from the business outcome.
+**Report HTML assembly failure.** `case_report.status = FAILED` with `error_detail` populated. Case retains its terminal business status (`COMPLETED`) and recommendation. `application_case.completed_at` stays NULL until the report is regenerated and uploaded.
 
-**PDF conversion failure.** HTML is already safely in Postgres. `pdf_dms_document_id` left null, report job marked retryable, PDF conversion retried from stored HTML — no pipeline re-run.
+**PDF conversion failure.** HTML is already safely in Postgres. `pdf_dms_document_id` left null, `case_report.status = FAILED` with `error_detail` populated. PDF conversion can be retried from stored HTML — no pipeline re-run.
 
 ---
 

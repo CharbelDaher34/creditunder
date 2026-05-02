@@ -5,15 +5,48 @@ services:
       POSTGRES_USER: creditunder
       POSTGRES_PASSWORD: creditunder
       POSTGRES_DB: creditunder
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+    # Enable WAL streaming replication.
+    # wal_level=replica   — emit enough WAL for a standby to follow.
+    # max_wal_senders=3   — allow up to 3 concurrent replication connections.
+    # wal_keep_size=128MB — keep 128 MB of WAL so a briefly-lagging replica
+    #                       can catch up without needing pg_basebackup again.
+    command: >
+      postgres
+        -c wal_level=replica
+        -c max_wal_senders=3
+        -c wal_keep_size=128MB
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U creditunder"]
       interval: 5s
       timeout: 5s
       retries: 5
+
+  postgres-replica:
+    image: postgres:16-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_USER: creditunder
+      POSTGRES_PASSWORD: creditunder
+      PRIMARY_HOST: postgres
+      PRIMARY_PORT: 5432
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replicator_secret
+    entrypoint: ["/replica/entrypoint.sh"]
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./postgres/replica/entrypoint.sh:/replica/entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U creditunder"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   kafka:
     image: apache/kafka:3.7.2
@@ -21,9 +54,9 @@ services:
       - CLUSTER_ID=5L6g3nShT-eMCtK--X86sw
       - KAFKA_NODE_ID=0
       - KAFKA_PROCESS_ROLES=controller,broker
-      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:19092
-      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_EXTERNAL_PORT:-19092}
-      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
       - KAFKA_CONTROLLER_QUORUM_VOTERS=0@kafka:9093
       - KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER
       - KAFKA_AUTO_CREATE_TOPICS_ENABLE=false
@@ -31,8 +64,6 @@ services:
       - KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS=1
       - KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1
       - KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1
-    ports:
-      - "${KAFKA_EXTERNAL_PORT:-19092}:19092"
     healthcheck:
       test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
       interval: 10s
@@ -109,7 +140,6 @@ services:
     env_file:
       - .env
     environment:
-      # Inside Docker, connect to services via their service names on internal ports
       - DATABASE_URL=postgresql+asyncpg://creditunder:creditunder@postgres:5432/creditunder
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - DMS_BASE_URL=http://dms:8001
@@ -125,6 +155,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-replica:
+        condition: service_healthy
       crm:
         condition: service_started
       dms:
@@ -133,6 +165,7 @@ services:
       - .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://creditunder:creditunder@postgres:5432/creditunder
+      - DATABASE_READ_URL=postgresql+asyncpg://creditunder:creditunder@postgres-replica:5432/creditunder
       - CRM_BASE_URL=http://crm:8003
       - DMS_BASE_URL=http://dms:8001
     volumes:
@@ -153,4 +186,4 @@ services:
 
 volumes:
   postgres_data:
-
+  postgres_replica_data:

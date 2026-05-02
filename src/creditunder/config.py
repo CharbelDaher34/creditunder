@@ -10,6 +10,17 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "postgresql+asyncpg://creditunder:creditunder@localhost:5432/creditunder"
+    # Optional read replica URL for the workbench. When unset the workbench
+    # falls back to `database_url`. Production deployments should point this at
+    # a Postgres read replica so UI traffic does not contend with the pipeline
+    # write path (see Section 12.2.5 in the system requirements).
+    database_read_url: str = ""
+
+    # Workbench
+    cors_origins: str = "*"
+
+    # CRM mockup (used by the workbench's demo submission helper)
+    crm_base_url: str = "http://localhost:8003"
 
     # Kafka
     kafka_bootstrap_servers: str = "localhost:19092"
@@ -28,6 +39,11 @@ class Settings(BaseSettings):
     # External services
     dms_base_url: str = "http://localhost:8001"
     edw_base_url: str = "http://localhost:8002"
+
+    @property
+    def effective_database_read_url(self) -> str:
+        """Read replica URL if configured, otherwise the primary."""
+        return self.database_read_url or self.database_url
 
     @property
     def effective_ai_base_url(self) -> str:

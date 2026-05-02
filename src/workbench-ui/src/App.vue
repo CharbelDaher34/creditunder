@@ -1,80 +1,97 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, onMounted, onUnmounted, watch } from 'vue'
 import Dashboard from './components/Dashboard.vue'
 import SubmitModal from './components/SubmitModal.vue'
 import CaseDetails from './components/CaseDetails.vue'
 import Notifications from './components/Notifications.vue'
+import UserSwitcher from './components/UserSwitcher.vue'
+import { eventSource } from './api'
+import { userStore } from './userStore'
 
 const isSubmitModalOpen = ref(false)
 const selectedCaseId = ref<string | null>(null)
 const refreshTrigger = ref(0)
 const notificationsRef = ref<any>(null)
 
-const openSubmitModal = () => {
-  isSubmitModalOpen.value = true
-}
+const openSubmitModal = () => { isSubmitModalOpen.value = true }
+const closeSubmitModal = () => { isSubmitModalOpen.value = false }
+const onApplicationSubmitted = () => { refreshTrigger.value++ }
+const viewCase = (id: string) => { selectedCaseId.value = id }
 
-const closeSubmitModal = () => {
-  isSubmitModalOpen.value = false
-}
+let es: EventSource | null = null
 
-const onApplicationSubmitted = () => {
-  refreshTrigger.value++
-}
-
-const viewCase = (id: string) => {
-  selectedCaseId.value = id
-}
-
-let eventSource: EventSource | null = null
-
-onMounted(() => {
-  eventSource = new EventSource('/api/notifications')
-  eventSource.addEventListener('case_updated', (event) => {
+function connectStream() {
+  if (es) { es.close(); es = null }
+  es = eventSource('/api/_demo/notifications')
+  es.addEventListener('case_updated', (event: MessageEvent) => {
     const data = JSON.parse(event.data)
+    const tone = data.status === 'COMPLETED' ? 'success'
+              : data.status === 'FAILED' ? 'danger'
+              : data.status === 'MANUAL_INTERVENTION_REQUIRED' ? 'warning'
+              : 'info'
     if (notificationsRef.value) {
-      notificationsRef.value.addToast(`Application ${data.application_id} finished processing with recommendation: ${data.recommendation}`)
+      const verdict = data.recommendation ? `Recommendation: ${data.recommendation}` : data.status
+      notificationsRef.value.addToast(`${data.application_id} · ${verdict}`, tone)
     }
     refreshTrigger.value++
   })
-})
+  es.onerror = () => { /* the browser auto-reconnects */ }
+}
 
-onUnmounted(() => {
-  if (eventSource) {
-    eventSource.close()
-  }
-})
+onMounted(() => connectStream())
+onUnmounted(() => { if (es) es.close() })
+
+// Reconnect SSE when the user switches identity, since the stream is scoped.
+watch(() => userStore.current, () => { connectStream(); refreshTrigger.value++ }, { deep: true })
 </script>
 
 <template>
-  <div class="app-container">
-    <header class="glass header">
-      <div>
-        <h1 class="title">Reviewer Workbench</h1>
-        <p class="subtitle">AI Credit Underwriting Platform</p>
+  <div class="shell">
+    <header class="appbar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true">
+            <defs>
+              <linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#a78bfa"/>
+                <stop offset="100%" stop-color="#38bdf8"/>
+              </linearGradient>
+            </defs>
+            <path fill="url(#lg)" d="M6 6h20v4H6zM6 14h14v4H6zM6 22h20v4H6z"/>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <div class="brand-title">Reviewer Workbench</div>
+          <div class="brand-sub">AI Credit Underwriting · Alinma Bank</div>
+        </div>
       </div>
-      <button class="btn btn-primary" @click="openSubmitModal">
-        Submit New Application
-      </button>
+
+      <div class="appbar-right">
+        <UserSwitcher />
+        <button class="btn btn-primary" @click="openSubmitModal">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+          Submit Application
+        </button>
+      </div>
     </header>
 
-    <main class="main-content">
-      <Dashboard 
-        :refreshTrigger="refreshTrigger" 
-        @viewCase="viewCase" 
+    <main class="main">
+      <Dashboard
+        :refresh-trigger="refreshTrigger"
+        @view-case="viewCase"
       />
     </main>
 
-    <SubmitModal 
-      v-if="isSubmitModalOpen" 
-      @close="closeSubmitModal" 
-      @submitted="onApplicationSubmitted" 
+    <SubmitModal
+      v-if="isSubmitModalOpen"
+      @close="closeSubmitModal"
+      @submitted="onApplicationSubmitted"
     />
 
-    <CaseDetails 
-      v-if="selectedCaseId" 
-      :caseId="selectedCaseId" 
-      @close="selectedCaseId = null" 
+    <CaseDetails
+      v-if="selectedCaseId"
+      :case-id="selectedCaseId"
+      @close="selectedCaseId = null"
     />
 
     <Notifications ref="notificationsRef" />
@@ -82,35 +99,51 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
-.app-container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 2rem;
-}
-
-.header {
+.shell {
+  min-height: 100vh;
   display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 1.5rem 2rem;
-  margin-bottom: 2rem;
+  flex-direction: column;
 }
 
-.title {
-  font-size: 1.5rem;
-  font-weight: 700;
-  margin-bottom: 0.25rem;
-  background: linear-gradient(to right, #60a5fa, #a78bfa);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
+.appbar {
+  position: sticky; top: 0; z-index: 30;
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 14px 28px;
+  background: rgba(11, 16, 32, 0.78);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--border);
 }
 
-.subtitle {
-  color: var(--text-secondary);
-  font-size: 0.875rem;
+.brand { display: flex; align-items: center; gap: 12px; }
+.brand-mark {
+  width: 38px; height: 38px; border-radius: 10px;
+  display: grid; place-items: center;
+  background: linear-gradient(135deg, rgba(99,102,241,0.25), rgba(56,189,248,0.18));
+  border: 1px solid var(--border-strong);
+}
+.brand-title {
+  font-size: 15px; font-weight: 600; letter-spacing: .01em;
+}
+.brand-sub {
+  font-size: 11px; color: var(--text-3); margin-top: 1px;
 }
 
-.main-content {
-  animation: fadeIn 0.5s ease-out;
+.appbar-right {
+  display: flex; align-items: center; gap: 12px;
+}
+
+.main {
+  flex: 1;
+  padding: 28px;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+@media (max-width: 720px) {
+  .appbar { padding: 12px 16px; }
+  .brand-sub { display: none; }
+  .main { padding: 16px; }
 }
 </style>
