@@ -32,7 +32,7 @@ class CaseStatus(str, Enum):
     CREATED                       — row inserted, processing not yet started.
     IN_PROGRESS                   — handler is running (documents fetched, AI calls in flight).
     COMPLETED                     — business processing produced a recommendation.
-                                    Delivery (report upload + EDW write) tracked separately.
+                                    Report upload tracked separately on case_report.
     FAILED                        — pipeline could not produce a recommendation
                                     (handler exception, invalid event, etc.). `error_detail` is set.
     MANUAL_INTERVENTION_REQUIRED  — pipeline cannot proceed without human action
@@ -55,12 +55,6 @@ class DocumentStatus(str, Enum):
     EXTRACTED = "EXTRACTED"
     EXTRACTION_FAILED = "EXTRACTION_FAILED"
     VALIDATION_COMPLETED = "VALIDATION_COMPLETED"
-
-
-class EDWStatus(str, Enum):
-    STAGED = "STAGED"
-    EXPORTED = "EXPORTED"
-    EXPORT_FAILED = "EXPORT_FAILED"
 
 
 class CaseReportStatus(str, Enum):
@@ -96,7 +90,6 @@ class JobType(str, Enum):
     VERIFY_AND_EXTRACT = "VERIFY_AND_EXTRACT"
     REPORT_GENERATION = "REPORT_GENERATION"
     REPORT_UPLOAD = "REPORT_UPLOAD"
-    EDW_WRITE = "EDW_WRITE"
 
 
 class JobStatus(str, Enum):

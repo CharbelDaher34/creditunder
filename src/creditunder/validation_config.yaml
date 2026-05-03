@@ -1,0 +1,35 @@
+# Validation configuration — versioned thresholds and mappings consumed by
+# product handlers and the AI confidence-check logic. Validation *logic*
+# (which rules exist, how they branch) lives in code (handlers/*.py); only
+# the *numbers* and the recommendation mapping live here so they can be
+# tuned without a code deploy.
+#
+# Every `validation_result` row is stamped with `config_version` so the
+# explainability PDF and the audit trail are reproducible across changes.
+# Bump `version` whenever any value below changes.
+
+version: "2026.05.01"
+
+# AI confidence threshold per document type. Fields extracted below the
+# applicable threshold emit a LOW_CONFIDENCE validation row.
+# `default` is used when a document type does not have an explicit entry.
+confidence_thresholds:
+  default: 0.70
+  ID_DOCUMENT: 0.70
+  SALARY_CERTIFICATE: 0.70
+
+# Personal Finance numeric tolerances.
+personal_finance:
+  # If |extracted_salary - declared_salary| / declared_salary exceeds this,
+  # the SALARY_DEVIATION rule emits a SOFT_MISMATCH.
+  salary_deviation_tolerance: 0.10
+
+# Recommendation mapping. Outcomes are evaluated in precedence order:
+#   HARD_BREACH > MANUAL_REVIEW_REQUIRED > SOFT_MISMATCH > LOW_CONFIDENCE > none
+# The first match wins; `default` applies when no rule matched.
+recommendation_mapping:
+  on_hard_breach: DECLINE
+  on_manual_review: HOLD
+  on_soft_mismatch: HOLD
+  on_low_confidence: HOLD
+  default: APPROVE

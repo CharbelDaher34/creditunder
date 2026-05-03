@@ -70,7 +70,6 @@ class ApplicationCase(Base):
 
     documents: Mapped[list["CaseDocument"]] = relationship(back_populates="case")
     report: Mapped["CaseReport | None"] = relationship(back_populates="case", uselist=False)
-    edw_staging: Mapped["EDWStaging | None"] = relationship(back_populates="case", uselist=False)
     audit_events: Mapped[list["AuditEvent"]] = relationship(back_populates="case")
     case_result: Mapped["CaseResultRow | None"] = relationship(back_populates="case", uselist=False)
     dms_artifacts: Mapped[list["DMSArtifact"]] = relationship(back_populates="case")
@@ -165,6 +164,12 @@ class ValidationResultRow(Base):
     expected_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     manual_review_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Version stamps — every rule outcome is reproducible across config
+    # and employer-rules updates by recording exactly which version was
+    # in force when the row was written. See BR-03 / BR-15 / BR-30.
+    rule_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    employer_rule_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    config_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -195,29 +200,6 @@ class CaseReport(Base):
     )
 
     case: Mapped["ApplicationCase"] = relationship(back_populates="report")
-
-
-class EDWStaging(Base):
-    __tablename__ = "edw_staging"
-
-    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
-    case_id: Mapped[UUID] = mapped_column(
-        ForeignKey("application_case.id"), nullable=False, unique=True
-    )
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    status: Mapped[str] = mapped_column(String(50), nullable=False, default="STAGED")
-    edw_confirmation_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    staged_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    export_error: Mapped[str | None] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    case: Mapped["ApplicationCase"] = relationship(back_populates="edw_staging")
 
 
 class DMSArtifact(Base):
@@ -293,6 +275,58 @@ class DeadLetterEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     case: Mapped["ApplicationCase | None"] = relationship()
+
+
+class EdwStaging(Base):
+    """Denormalised case snapshot written once per completed case.
+
+    The Reviewer Workbench reads exclusively from this table. Promoted columns
+    support efficient list-view filtering and role-based row scoping without
+    touching the pipeline tables. The `payload` JSONB holds the full
+    CaseDetail-shaped snapshot so the detail view needs no joins.
+    """
+
+    __tablename__ = "edw_staging"
+
+    id: Mapped[UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
+    case_id: Mapped[UUID] = mapped_column(
+        ForeignKey("application_case.id"), nullable=False, unique=True
+    )
+
+    # Promoted columns — kept in sync with payload at write time.
+    application_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    validator_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    supervisor_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    product_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    branch_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    applicant_name: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    status: Mapped[str] = mapped_column(String(50), nullable=False)
+    recommendation: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    manual_review_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    pdf_dms_document_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Full denormalised payload — the workbench detail view reads from here.
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+
+    # EDW export tracking (reserved for future integration).
+    export_status: Mapped[str] = mapped_column(String(50), nullable=False, default="STAGED")
+    edw_confirmation_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    export_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    staged_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    case: Mapped["ApplicationCase"] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint("case_id", name="uq_edw_staging_case_id"),
+        Index("ix_edw_staging_status", "status"),
+    )
 
 
 class AuditEvent(Base):

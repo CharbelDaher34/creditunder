@@ -20,9 +20,16 @@ const viewCase = (id: string) => { selectedCaseId.value = id }
 
 let es: EventSource | null = null
 
-function connectStream() {
+async function connectStream() {
   if (es) { es.close(); es = null }
-  es = eventSource('/api/_demo/notifications')
+  try {
+    es = await eventSource('/api/_demo/notifications')
+  } catch {
+    // Token mint failed (server not yet up or user not authenticated).
+    // The watch will retry on next identity change; the user can also
+    // manually trigger a refresh by switching user in the UserSwitcher.
+    return
+  }
   es.addEventListener('case_updated', (event: MessageEvent) => {
     const data = JSON.parse(event.data)
     const tone = data.status === 'COMPLETED' ? 'success'
@@ -38,7 +45,7 @@ function connectStream() {
   es.onerror = () => { /* the browser auto-reconnects */ }
 }
 
-onMounted(() => connectStream())
+onMounted(() => { connectStream() })
 onUnmounted(() => { if (es) es.close() })
 
 // Reconnect SSE when the user switches identity, since the stream is scoped.

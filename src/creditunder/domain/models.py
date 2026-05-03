@@ -1,6 +1,6 @@
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Generic, Optional, TypeVar
+from dataclasses import dataclass, field
+from datetime import date, datetime
+from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -23,6 +23,70 @@ class ExtractedField(BaseModel, Generic[T]):
     normalized_label: str
 
 
+# --------------------------------------------------------------------- #
+#  Employer snapshot (carried inside applicant_data)                     #
+# --------------------------------------------------------------------- #
+
+
+EmployerClass = Literal["A", "B", "C", "D", "GOV"]
+
+
+class EmployerSnapshot(BaseModel):
+    """Employer information snapshotted by CRM at event-publish time.
+
+    Carried inside `applicant_data["employer_snapshot"]`. CRM resolves the
+    employer record against the governed employer-rules source and embeds
+    the snapshot here so the handler never needs to fetch it.
+
+    `rule_version` and `rule_source_date` identify exactly which rules
+    version produced this snapshot — both are stamped onto every
+    `validation_result` row that consumed employer data, so the audit
+    trail is reproducible across rule updates.
+    """
+
+    employer_id: str
+    employer_name_normalized: str
+    employer_class: EmployerClass
+    active_restrictions: list[str] = []
+    max_limit_note: str | None = None
+    rule_version: str
+    rule_source_date: date
+
+    @classmethod
+    def from_applicant_data(cls, applicant_data: dict | None) -> "EmployerSnapshot | None":
+        if not applicant_data:
+            return None
+        raw = applicant_data.get("employer_snapshot")
+        if not raw:
+            return None
+        return cls.model_validate(raw)
+
+
+# --------------------------------------------------------------------- #
+#  Required-document set (returned by handlers)                          #
+# --------------------------------------------------------------------- #
+
+
+@dataclass
+class RequiredDocumentSet:
+    """What a product handler expects, given the applicant context.
+
+    `required` — must all be present, otherwise the case is moved to
+        `MANUAL_INTERVENTION_REQUIRED`.
+    `optional` — accepted if present, ignored if absent.
+    `unsupported` — must NOT be present; flagged if uploaded.
+    """
+
+    required: set[DocumentType]
+    optional: set[DocumentType] = field(default_factory=set)
+    unsupported: set[DocumentType] = field(default_factory=set)
+
+
+# --------------------------------------------------------------------- #
+#  Validation results                                                    #
+# --------------------------------------------------------------------- #
+
+
 @dataclass
 class ValidationResult:
     rule_code: str
@@ -33,6 +97,11 @@ class ValidationResult:
     expected_value: Any | None = None
     confidence: float | None = None
     manual_review_required: bool = False
+    # Version stamps — every rule outcome is reproducible across config /
+    # employer-rules updates by storing which version was applied.
+    rule_version: str | None = None              # set by handlers when the rule logic itself is versioned
+    employer_rule_version: str | None = None     # set when the rule consumed employer-snapshot data
+    config_version: str | None = None            # set automatically from validation_config.yaml
 
 
 @dataclass
@@ -55,6 +124,11 @@ class CaseResult:
     recommendation_rationale: str
     manual_review_required: bool = False
     completed_at: datetime | None = None
+
+
+# --------------------------------------------------------------------- #
+#  Inbound Kafka event                                                   #
+# --------------------------------------------------------------------- #
 
 
 class ApplicationEvent(BaseModel):

@@ -34,11 +34,9 @@ class Settings(BaseSettings):
     ai_base_url: str = _OPENAI_OFFICIAL_BASE_URL
     ai_api_key: str = "sk-placeholder"
     ai_model: str = "gpt-4o"
-    ai_confidence_threshold: float = 0.7
 
     # External services
     dms_base_url: str = "http://localhost:8001"
-    edw_base_url: str = "http://localhost:8002"
 
     @property
     def effective_database_read_url(self) -> str:

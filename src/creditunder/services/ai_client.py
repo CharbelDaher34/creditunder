@@ -15,6 +15,7 @@ from creditunder.documents.base import BaseExtractionSchema
 log = structlog.get_logger(__name__)
 
 _agent_cache: dict[DocumentType, Agent] = {}
+_narrative_agent_cache: dict[int, Agent] = {}
 
 
 def _get_agent(document_type: DocumentType, model: OpenAIChatModel) -> Agent:
@@ -39,8 +40,29 @@ def _get_agent(document_type: DocumentType, model: OpenAIChatModel) -> Agent:
             model=model,
             output_type=schema_cls,
             system_prompt=system_prompt,
+            model_settings={"temperature": 0.0},
         )
     return _agent_cache[document_type]
+
+
+def _get_narrative_agent(model: OpenAIChatModel) -> Agent:
+    cache_key = id(model)
+    if cache_key not in _narrative_agent_cache:
+        _narrative_agent_cache[cache_key] = Agent(
+            model=model,
+            system_prompt=(
+                "You are a senior credit analyst at a bank. "
+                "Write exactly ONE concise paragraph (3-5 sentences) that: "
+                "1) opens with a direct statement of the recommendation (APPROVE / HOLD / DECLINE), "
+                "2) cites the one or two specific findings that drove it (e.g. salary deviation, "
+                "   expired ID, employer class restriction, verification confidence), "
+                "3) notes any mandatory manual checks the reviewer must complete before signing off. "
+                "Be factual and precise — no filler phrases, no restating the applicant name or product. "
+                "Do not use bullet points or headings."
+            ),
+            model_settings={"temperature": 0.3},
+        )
+    return _narrative_agent_cache[cache_key]
 
 
 class VerifyAndExtractResult(BaseModel):
@@ -52,12 +74,11 @@ class VerifyAndExtractResult(BaseModel):
 
 
 class AIClient:
-    def __init__(self, base_url: str, api_key: str, model: str, confidence_threshold: float = 0.7):
+    def __init__(self, base_url: str, api_key: str, model: str):
         self._model = OpenAIChatModel(
             model,
             provider=OpenAIProvider(base_url=base_url, api_key=api_key),
         )
-        self._confidence_threshold = confidence_threshold
 
     async def verify_and_extract(
         self,
@@ -116,18 +137,8 @@ class AIClient:
         )
 
     async def generate_narrative(self, case_summary: dict[str, Any]) -> str:
-        narrative_agent = Agent(
-            model=self._model,
-            system_prompt=(
-                "You are a credit analyst writing a formal report narrative for a bank validator. "
-                "Write a concise, professional summary (3-5 paragraphs) covering: "
-                "document verification status, key extracted data, validation findings, and the recommendation. "
-                "Be factual and objective. Do not use bullet points — use flowing prose."
-            ),
-        )
-
+        narrative_agent = _get_narrative_agent(self._model)
         user_message = f"Case data:\n{json.dumps(case_summary, indent=2, default=str)}"
         log.info("ai.generate_narrative", application_id=case_summary.get("application_id"))
-
         result = await narrative_agent.run(user_message)
         return result.output

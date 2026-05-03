@@ -37,14 +37,12 @@ export async function apiBlob(path: string): Promise<Blob> {
   return res.blob()
 }
 
-export function eventSource(path: string): EventSource {
-  // Browsers don't allow custom headers on EventSource. Embed identity in the
-  // query string and have the backend honour it as an alternate auth signal,
-  // OR (as we do now in the demo namespace) rely on cookie/session. For
-  // deployment this should be replaced by a proper SSO bearer token in a
-  // cookie. The notification stream here is a demo helper.
+export async function eventSource(path: string): Promise<EventSource> {
+  // Browsers cannot send custom headers on EventSource. We first POST to the
+  // token endpoint (with normal auth headers) to get a short-lived opaque
+  // token, then open the stream URL with only that token in the query string.
+  const { token } = await apiPost<{ token: string }>('/api/_demo/notifications/token', {})
   const url = new URL(path, window.location.origin)
-  url.searchParams.set('_uid', userStore.current.user_id)
-  url.searchParams.set('_role', userStore.current.role)
+  url.searchParams.set('token', token)
   return new EventSource(url.toString())
 }

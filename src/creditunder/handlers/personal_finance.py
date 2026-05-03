@@ -1,7 +1,13 @@
 from datetime import date
 
 from creditunder.domain.enums import DocumentType, ProductType, ValidationOutcome
-from creditunder.domain.models import DocumentResult, ExtractedField, ValidationResult
+from creditunder.domain.models import (
+    DocumentResult,
+    EmployerSnapshot,
+    ExtractedField,
+    RequiredDocumentSet,
+    ValidationResult,
+)
 from creditunder.handlers.base import BaseProductHandler
 
 
@@ -10,46 +16,67 @@ class PersonalFinanceHandler(BaseProductHandler):
     def product_type(self) -> ProductType:
         return ProductType.PERSONAL_FINANCE
 
-    @property
-    def required_documents(self) -> list[DocumentType]:
-        return [DocumentType.ID_DOCUMENT, DocumentType.SALARY_CERTIFICATE]
+    # BR-13 Personal Finance employer-class document matrix:
+    #   Class A     → Salary Certificate (+ ID)
+    #   Class B     → Salary Certificate + Salary Transfer Letter (+ ID)
+    #   Class C/D   → Subscription & Wage Certificate (+ ID)
+    #
+    # Only ID_DOCUMENT and SALARY_CERTIFICATE are modelled in the document
+    # registry today, so every class collapses to the same MVP set. Add a
+    # branch here once SALARY_TRANSFER_LETTER / SUBSCRIPTION_WAGE_CERTIFICATE
+    # are registered.
+    def required_documents(self, applicant_data: dict) -> RequiredDocumentSet:
+        return RequiredDocumentSet(
+            required={DocumentType.ID_DOCUMENT, DocumentType.SALARY_CERTIFICATE}
+        )
+
+    # ----------------------------------------------------------------- #
+    #  Validation                                                        #
+    # ----------------------------------------------------------------- #
 
     def validate(self, application_id, applicant_data, document_results):
+        employer = EmployerSnapshot.from_applicant_data(applicant_data)
         results: list[ValidationResult] = []
 
         id_doc = self._find_doc(document_results, DocumentType.ID_DOCUMENT)
         salary_doc = self._find_doc(document_results, DocumentType.SALARY_CERTIFICATE)
 
         if id_doc:
-            results += self._low_confidence_check(id_doc.extracted_data)
+            results += self._low_confidence_check(id_doc.extracted_data, DocumentType.ID_DOCUMENT)
             results += self._validate_id(applicant_data, id_doc.extracted_data)
 
         if salary_doc:
-            results += self._low_confidence_check(salary_doc.extracted_data)
-            results += self._validate_salary(applicant_data, salary_doc.extracted_data)
+            results += self._low_confidence_check(
+                salary_doc.extracted_data, DocumentType.SALARY_CERTIFICATE
+            )
+            results += self._validate_salary(applicant_data, salary_doc.extracted_data, employer)
 
         if not id_doc or not id_doc.verification_passed:
-            results.append(
+            results.append(self._stamp_versions(
                 ValidationResult(
                     rule_code="ID_VERIFICATION_FAILED",
                     outcome=ValidationOutcome.HARD_BREACH,
                     description="ID document could not be verified as a valid national ID.",
-                )
-            )
+                ),
+                employer=employer,
+            ))
 
         if not salary_doc or not salary_doc.verification_passed:
-            results.append(
+            results.append(self._stamp_versions(
                 ValidationResult(
                     rule_code="SALARY_CERT_VERIFICATION_FAILED",
                     outcome=ValidationOutcome.HARD_BREACH,
                     description="Salary certificate could not be verified.",
-                )
-            )
+                ),
+                employer=employer,
+            ))
 
         recommendation, rationale = self._derive_recommendation(results)
         return results, recommendation, rationale
 
-    # ---- rule implementations ----
+    # ----------------------------------------------------------------- #
+    #  Rule implementations                                              #
+    # ----------------------------------------------------------------- #
 
     def _validate_id(
         self, applicant_data: dict, fields: dict[str, ExtractedField]
@@ -61,7 +88,7 @@ class PersonalFinanceHandler(BaseProductHandler):
             extracted_id = str(fields["id_number"].value).strip()
             declared_id = str(applicant_data.get("id_number", "")).strip()
             if extracted_id != declared_id:
-                results.append(
+                results.append(self._stamp_versions(
                     ValidationResult(
                         rule_code="ID_NUMBER_MISMATCH",
                         outcome=ValidationOutcome.HARD_BREACH,
@@ -70,14 +97,14 @@ class PersonalFinanceHandler(BaseProductHandler):
                         extracted_value=extracted_id,
                         expected_value=declared_id,
                     )
-                )
+                ))
 
         # Rule: Name similarity check (case-insensitive, trimmed)
         if "full_name" in fields:
             extracted_name = str(fields["full_name"].value).strip().upper()
             declared_name = str(applicant_data.get("name", "")).strip().upper()
             if extracted_name != declared_name:
-                results.append(
+                results.append(self._stamp_versions(
                     ValidationResult(
                         rule_code="ID_NAME_CHECK",
                         outcome=ValidationOutcome.SOFT_MISMATCH,
@@ -86,14 +113,14 @@ class PersonalFinanceHandler(BaseProductHandler):
                         extracted_value=extracted_name,
                         expected_value=declared_name,
                     )
-                )
+                ))
 
         # Rule: ID must not be expired
         if "expiry_date" in fields:
             try:
                 expiry = date.fromisoformat(str(fields["expiry_date"].value))
                 if expiry < date.today():
-                    results.append(
+                    results.append(self._stamp_versions(
                         ValidationResult(
                             rule_code="ID_EXPIRED",
                             outcome=ValidationOutcome.HARD_BREACH,
@@ -101,9 +128,9 @@ class PersonalFinanceHandler(BaseProductHandler):
                             field_name="expiry_date",
                             extracted_value=str(expiry),
                         )
-                    )
+                    ))
             except ValueError:
-                results.append(
+                results.append(self._stamp_versions(
                     ValidationResult(
                         rule_code="ID_EXPIRY_PARSE_ERROR",
                         outcome=ValidationOutcome.MANUAL_REVIEW_REQUIRED,
@@ -111,55 +138,68 @@ class PersonalFinanceHandler(BaseProductHandler):
                         field_name="expiry_date",
                         manual_review_required=True,
                     )
-                )
+                ))
 
         return results
 
     def _validate_salary(
-        self, applicant_data: dict, fields: dict[str, ExtractedField]
+        self,
+        applicant_data: dict,
+        fields: dict[str, ExtractedField],
+        employer: EmployerSnapshot | None,
     ) -> list[ValidationResult]:
+        cfg = self._config()
         results = []
 
-        # Rule: Employer must match CRM record
+        # Rule: Employer must match CRM record. When an employer snapshot is
+        # present, prefer the normalized name from the rules source — this
+        # is the canonical comparison anchor (BR-07).
         if "employer_name" in fields:
             extracted_employer = str(fields["employer_name"].value).strip().upper()
-            declared_employer = str(applicant_data.get("employer", "")).strip().upper()
-            if extracted_employer != declared_employer:
-                results.append(
+            if employer is not None:
+                expected_employer = employer.employer_name_normalized.strip().upper()
+            else:
+                expected_employer = str(applicant_data.get("employer", "")).strip().upper()
+            if extracted_employer != expected_employer:
+                results.append(self._stamp_versions(
                     ValidationResult(
                         rule_code="SALARY_EMPLOYER_MATCH",
                         outcome=ValidationOutcome.SOFT_MISMATCH,
                         description="Employer on salary certificate does not match CRM record.",
                         field_name="employer_name",
                         extracted_value=extracted_employer,
-                        expected_value=declared_employer,
-                    )
-                )
+                        expected_value=expected_employer,
+                    ),
+                    employer=employer,
+                ))
 
-        # Rule: Salary within 10% of declared salary
+        # Rule: Salary within configured tolerance of declared salary.
+        tolerance = cfg.personal_finance.salary_deviation_tolerance
         if "total_salary" in fields:
             try:
                 extracted_salary = float(fields["total_salary"].value)
                 declared_salary = float(applicant_data.get("declared_salary", 0))
                 if declared_salary > 0:
                     deviation = abs(extracted_salary - declared_salary) / declared_salary
-                    if deviation > 0.10:
-                        results.append(
+                    if deviation > tolerance:
+                        results.append(self._stamp_versions(
                             ValidationResult(
                                 rule_code="SALARY_DEVIATION",
                                 outcome=ValidationOutcome.SOFT_MISMATCH,
                                 description=(
-                                    f"Salary deviation {deviation:.1%} exceeds 10% tolerance. "
+                                    f"Salary deviation {deviation:.1%} exceeds "
+                                    f"{tolerance:.0%} tolerance. "
                                     f"Extracted: {extracted_salary:,.0f} SAR, "
                                     f"Declared: {declared_salary:,.0f} SAR."
                                 ),
                                 field_name="total_salary",
                                 extracted_value=extracted_salary,
                                 expected_value=declared_salary,
-                            )
-                        )
+                            ),
+                            employer=employer,
+                        ))
             except (ValueError, TypeError):
-                results.append(
+                results.append(self._stamp_versions(
                     ValidationResult(
                         rule_code="SALARY_PARSE_ERROR",
                         outcome=ValidationOutcome.MANUAL_REVIEW_REQUIRED,
@@ -167,7 +207,7 @@ class PersonalFinanceHandler(BaseProductHandler):
                         field_name="total_salary",
                         manual_review_required=True,
                     )
-                )
+                ))
 
         return results
 

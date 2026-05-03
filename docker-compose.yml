@@ -97,15 +97,6 @@ services:
     volumes:
       - ./dms_data:/data
 
-  edw:
-    build:
-      context: .
-      dockerfile: mockups/edw/Dockerfile
-    ports:
-      - "${EDW_PORT:-8002}:8002"
-    environment:
-      - EDW_PORT=8002
-
   crm:
     build:
       context: .
@@ -135,15 +126,12 @@ services:
         condition: service_completed_successfully
       dms:
         condition: service_started
-      edw:
-        condition: service_started
     env_file:
       - .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://creditunder:creditunder@postgres:5432/creditunder
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - DMS_BASE_URL=http://dms:8001
-      - EDW_BASE_URL=http://edw:8002
     volumes:
       - ./logs:/logs
     restart: on-failure
@@ -151,7 +139,7 @@ services:
   workbench_api:
     build:
       context: .
-      dockerfile: src/creditunder/workbench.Dockerfile
+      dockerfile: src/workbench/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy

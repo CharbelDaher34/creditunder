@@ -3,96 +3,549 @@
 <head>
 <meta charset="UTF-8">
 <style>
-  body { font-family: Arial, sans-serif; font-size: 11pt; color: #1a1a1a; margin: 40px; }
-  h1 { font-size: 16pt; color: #003366; border-bottom: 2px solid #003366; padding-bottom: 6px; }
-  h2 { font-size: 13pt; color: #003366; margin-top: 24px; border-bottom: 1px solid #cccccc; }
-  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 10pt; }
-  th { background: #003366; color: white; padding: 6px 10px; text-align: left; }
-  td { padding: 5px 10px; border-bottom: 1px solid #e0e0e0; }
-  tr:nth-child(even) { background: #f7f9fc; }
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 4px; font-weight: bold; font-size: 10pt; }
-  .APPROVE { background: #d4edda; color: #155724; }
-  .HOLD { background: #fff3cd; color: #856404; }
-  .DECLINE { background: #f8d7da; color: #721c24; }
-  .HARD_BREACH { background: #f8d7da; color: #721c24; }
-  .SOFT_MISMATCH { background: #fff3cd; color: #856404; }
-  .LOW_CONFIDENCE { background: #d1ecf1; color: #0c5460; }
-  .MANUAL_REVIEW_REQUIRED { background: #e2e3e5; color: #383d41; }
-  .PASSED { background: #d4edda; color: #155724; }
-  .header-meta { color: #666; font-size: 10pt; margin-bottom: 20px; }
-  .narrative { background: #f7f9fc; padding: 16px; border-left: 4px solid #003366; margin-top: 10px; line-height: 1.6; }
-  .confidence-low { color: #856404; }
-  .confidence-ok { color: #155724; }
+/* ── Reset & base ──────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: "Helvetica Neue", Arial, sans-serif;
+  font-size: 10pt;
+  color: #1e2433;
+  background: #fff;
+  padding: 36px 44px;
+  line-height: 1.5;
+}
+
+/* ── Page-break control (WeasyPrint) ───────────────────────────────── */
+/* Repeat column headers when a table spans multiple pages */
+thead { display: table-header-group; }
+tfoot { display: table-footer-group; }
+
+/* Never split a single row across a page boundary */
+tr  { break-inside: avoid; page-break-inside: avoid; }
+
+/* Allow tables to break across pages, but keep section blocks together */
+table { break-inside: auto; page-break-inside: auto; }
+
+/* Keep the following block-level elements intact if they fit on a page */
+.rec-hero, .info-panel, .doc-card, .section-title {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+/* Prevent an orphaned section title at the bottom of a page */
+.section-title { break-after: avoid; page-break-after: avoid; }
+
+/* ── Page header ───────────────────────────────────────────────────── */
+.page-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  border-bottom: 3px solid #1a3a6b;
+  padding-bottom: 14px;
+  margin-bottom: 24px;
+}
+.page-header-left h1 {
+  font-size: 17pt;
+  font-weight: 700;
+  color: #1a3a6b;
+  letter-spacing: -.3px;
+}
+.page-header-left .sub {
+  font-size: 9pt;
+  color: #6b7280;
+  margin-top: 3px;
+}
+.page-header-right {
+  text-align: right;
+  font-size: 9pt;
+  color: #6b7280;
+  line-height: 1.7;
+}
+
+/* ── Recommendation hero ───────────────────────────────────────────── */
+.rec-hero {
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 24px;
+}
+.rec-badge-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 20px 28px;
+  min-width: 130px;
+}
+.rec-badge-col.APPROVE { background: #dcfce7; }
+.rec-badge-col.HOLD    { background: #fef9c3; }
+.rec-badge-col.DECLINE { background: #fee2e2; }
+.rec-label {
+  font-size: 8pt;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  opacity: .7;
+  margin-bottom: 6px;
+}
+.rec-word {
+  font-size: 20pt;
+  font-weight: 800;
+  letter-spacing: .04em;
+}
+.rec-word.APPROVE { color: #15803d; }
+.rec-word.HOLD    { color: #a16207; }
+.rec-word.DECLINE { color: #b91c1c; }
+.rec-narrative-col {
+  flex: 1;
+  padding: 18px 22px;
+  border-left: 1px solid #e5e7eb;
+  background: #f9fafb;
+}
+.rec-narrative-title {
+  font-size: 8.5pt;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: #6b7280;
+  margin-bottom: 8px;
+}
+.rec-narrative-text {
+  font-size: 10.5pt;
+  color: #1e2433;
+  line-height: 1.6;
+}
+.rec-rationale {
+  margin-top: 10px;
+  font-size: 9pt;
+  color: #4b5563;
+  font-style: italic;
+  border-top: 1px dashed #d1d5db;
+  padding-top: 8px;
+}
+
+/* ── Section headings ──────────────────────────────────────────────── */
+.section-title {
+  font-size: 11.5pt;
+  font-weight: 700;
+  color: #1a3a6b;
+  margin: 26px 0 10px;
+  padding-bottom: 5px;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+/* ── Info panel (key-value pairs) ──────────────────────────────────── */
+.info-panel {
+  background: #f9fafb;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 12px 16px;
+  margin-bottom: 14px;
+}
+.info-panel dl { display: grid; grid-template-columns: 180px 1fr; gap: 5px 12px; }
+.info-panel dt { font-weight: 600; font-size: 9pt; color: #4b5563; }
+.info-panel dd { font-size: 9.5pt; color: #1e2433; }
+
+/* ── Tables ────────────────────────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 14px;
+  font-size: 9.5pt;
+  /* Fixed layout honours explicit column widths and forces text to wrap
+     within each cell instead of pushing the table wider than the page. */
+  table-layout: fixed;
+}
+thead th {
+  background: #1a3a6b;
+  color: #fff;
+  padding: 7px 10px;
+  text-align: left;
+  font-size: 8.5pt;
+  font-weight: 600;
+  letter-spacing: .04em;
+  /* Wrap long header text rather than stretching the column */
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+tbody td {
+  padding: 6px 10px;
+  border-bottom: 1px solid #e5e7eb;
+  vertical-align: top;
+  /* Force cell content to wrap — prevents horizontal overflow */
+  word-break: break-word;
+  overflow-wrap: break-word;
+  hyphens: auto;
+}
+tbody tr:last-child td { border-bottom: none; }
+tbody tr:nth-child(even) td { background: #f9fafb; }
+
+/* ── Outcome badges ────────────────────────────────────────────────── */
+.badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 4px;
+  font-size: 8.5pt;
+  font-weight: 700;
+  letter-spacing: .02em;
+}
+.APPROVE, .PASSED  { background: #dcfce7; color: #15803d; }
+.HOLD              { background: #fef9c3; color: #a16207; }
+.DECLINE, .FAILED  { background: #fee2e2; color: #b91c1c; }
+.HARD_BREACH       { background: #fee2e2; color: #b91c1c; }
+.SOFT_MISMATCH     { background: #fef9c3; color: #a16207; }
+.LOW_CONFIDENCE    { background: #dbeafe; color: #1e40af; }
+.MANUAL_REVIEW_REQUIRED { background: #f3f4f6; color: #374151; }
+
+/* ── Confidence bar ────────────────────────────────────────────────── */
+.conf-wrap { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.conf-bar { display: inline-block; width: 60px; height: 6px; background: #e5e7eb; border-radius: 3px; vertical-align: middle; }
+.conf-fill { display: block; height: 100%; border-radius: 3px; }
+.conf-high { background: #22c55e; }
+.conf-med  { background: #f59e0b; }
+.conf-low  { background: #ef4444; }
+
+/* ── Document section ──────────────────────────────────────────────── */
+.doc-card {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 20px;
+}
+.doc-card-header {
+  background: #1a3a6b;
+  color: #fff;
+  padding: 9px 16px;
+}
+.doc-card-header .doc-title { font-size: 10pt; font-weight: 600; }
+.doc-card-header .doc-meta  { font-size: 8.5pt; opacity: .75; margin-top: 2px; }
+.doc-verify-row {
+  padding: 8px 12px;
+  background: #f9fafb;
+  border-bottom: 1px solid #e5e7eb;
+  font-size: 9pt;
+}
+
+/* Two-column body via CSS table — WeasyPrint handles display:table
+   across page breaks more reliably than flexbox. */
+.doc-body {
+  display: table;
+  width: 100%;
+  border-collapse: collapse;
+}
+.doc-preview {
+  display: table-cell;
+  width: 42%;
+  padding: 12px;
+  background: #f3f4f6;
+  border-right: 1px solid #e5e7eb;
+  vertical-align: top;
+  text-align: center;
+}
+.doc-preview img {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 4px;
+  border: 1px solid #d1d5db;
+}
+.doc-preview .no-preview {
+  padding: 32px 8px;
+  color: #9ca3af;
+  font-size: 9pt;
+}
+.doc-fields {
+  display: table-cell;
+  vertical-align: top;
+  padding: 0;
+}
+/* Reset the table-inside-table-cell: must NOT inherit table-layout:fixed
+   from the outer table rule — give it auto so columns size to content. */
+.doc-fields table {
+  margin: 0;
+  table-layout: auto;
+  width: 100%;
+}
+.doc-fields thead th { background: #374151; font-size: 8pt; padding: 5px 8px; }
+.doc-fields tbody td { padding: 5px 8px; font-size: 9pt; }
+
+/* ── Technical exceptions ──────────────────────────────────────────── */
+.tech-banner {
+  background: #f5f5f5;
+  border-left: 4px solid #9ca3af;
+  padding: 10px 14px;
+  margin-bottom: 10px;
+  font-size: 9pt;
+  color: #4b5563;
+  border-radius: 0 4px 4px 0;
+}
+.tech-badge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 4px;
+  font-size: 8pt;
+  font-weight: 700;
+  background: #f3f4f6;
+  color: #374151;
+  border: 1px dashed #9ca3af;
+}
+.tech-row td { border-left: 3px solid #9ca3af !important; }
+
+/* ── Footer ────────────────────────────────────────────────────────── */
+.page-footer {
+  margin-top: 32px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+  color: #9ca3af;
+  font-size: 8.5pt;
+  display: flex;
+  justify-content: space-between;
+}
 </style>
 </head>
 <body>
 
-<h1>Credit Underwriting Report — {{ application_id }}</h1>
-<div class="header-meta">
-  Generated: {{ generated_at }} &nbsp;|&nbsp;
-  Product: {{ product_type }} &nbsp;|&nbsp;
-  Branch: {{ branch_name }} &nbsp;|&nbsp;
-  Validator: {{ validator_id }}
+{# ── Page header ───────────────────────────────────────────────────── #}
+<div class="page-header">
+  <div class="page-header-left">
+    <h1>Credit Underwriting Report</h1>
+    <div class="sub">Application {{ application_id }} &nbsp;·&nbsp; {{ product_type.replace('_', ' ') }}</div>
+  </div>
+  <div class="page-header-right">
+    Generated {{ generated_at }}<br>
+    Branch: {{ branch_name }}<br>
+    Reviewer: {{ validator_id }}
+  </div>
 </div>
 
-<h2>Recommendation</h2>
-<p>
-  <span class="badge {{ recommendation }}">{{ recommendation }}</span>
-  &nbsp; {{ recommendation_rationale }}
-</p>
+{# ── Recommendation hero ───────────────────────────────────────────── #}
+<div class="rec-hero">
+  <div class="rec-badge-col {{ recommendation }}">
+    <div class="rec-label">Recommendation</div>
+    <div class="rec-word {{ recommendation }}">{{ recommendation }}</div>
+  </div>
+  <div class="rec-narrative-col">
+    <div class="rec-narrative-title">Analyst Assessment</div>
+    <div class="rec-narrative-text">{{ narrative }}</div>
+    {% if recommendation_rationale %}
+    <div class="rec-rationale">{{ recommendation_rationale }}</div>
+    {% endif %}
+  </div>
+</div>
 
-<h2>Applicant Data</h2>
+{# ── Employer Rules ────────────────────────────────────────────────── #}
+{% if employer_snapshot %}
+<div class="section-title">Employer Rules</div>
+<div class="info-panel">
+  <dl>
+    <dt>Employer</dt>
+    <dd>{{ employer_snapshot.employer_name_normalized }} ({{ employer_snapshot.employer_id }})</dd>
+    <dt>Class</dt>
+    <dd>{{ employer_snapshot.employer_class }}</dd>
+    <dt>Active restrictions</dt>
+    <dd>{% if employer_snapshot.active_restrictions %}{{ employer_snapshot.active_restrictions | join(', ') }}{% else %}—{% endif %}</dd>
+    {% if employer_snapshot.max_limit_note %}
+    <dt>Max-limit note</dt><dd>{{ employer_snapshot.max_limit_note }}</dd>
+    {% endif %}
+    <dt>Rule version</dt>
+    <dd>{{ employer_snapshot.rule_version }} (source dated {{ employer_snapshot.rule_source_date }})</dd>
+  </dl>
+</div>
+{% endif %}
+
+{# ── Document Completeness ─────────────────────────────────────────── #}
+<div class="section-title">Document Completeness</div>
+<div class="info-panel">
+  <dl>
+    <dt>Required</dt><dd>{{ required_documents | join(', ') if required_documents else '—' }}</dd>
+    <dt>Received</dt><dd>{{ received_documents | join(', ') if received_documents else '—' }}</dd>
+    <dt>Missing</dt><dd>{% if missing_documents %}{{ missing_documents | join(', ') }}{% else %}none{% endif %}</dd>
+  </dl>
+</div>
+
+{# ── Applicant Data ────────────────────────────────────────────────── #}
+<div class="section-title">Applicant Data</div>
 <table>
-  <tr><th>Field</th><th>Value</th></tr>
+  <thead><tr><th style="width:35%">Field</th><th>Value</th></tr></thead>
+  <tbody>
   {% for k, v in applicant_data.items() %}
-  <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+  {% if k != "employer_snapshot" %}
+  <tr><td>{{ k.replace('_', ' ').title() }}</td><td>{{ v }}</td></tr>
+  {% endif %}
   {% endfor %}
+  </tbody>
 </table>
 
-<h2>Document Verification & Extraction</h2>
+{# ── Documents with Extracted Fields ──────────────────────────────── #}
+<div class="section-title">Documents &amp; Extracted Data</div>
 {% for doc in document_results %}
-<h3 style="margin-top:16px; font-size:11pt;">{{ doc.document_type }} — {{ doc.document_name }} ({{ doc.document_id }})</h3>
-<p>
-  Verification:
-  {% if doc.verification_passed %}
-    <span class="badge APPROVE">PASSED</span>
-  {% else %}
-    <span class="badge DECLINE">FAILED</span>
-  {% endif %}
-  &nbsp; Confidence: {{ "%.0f"|format(doc.verification_confidence * 100) }}%
-</p>
-<table>
-  <tr><th>Field</th><th>Value</th><th>Confidence</th><th>Page</th></tr>
-  {% for label, ef in doc.extracted_data.items() %}
-  <tr>
-    <td>{{ ef.normalized_label }}</td>
-    <td>{{ ef.value }}</td>
-    <td class="{% if ef.confidence < 0.7 %}confidence-low{% else %}confidence-ok{% endif %}">
-      {{ "%.0f"|format(ef.confidence * 100) }}%
-    </td>
-    <td>{{ ef.page_reference }}</td>
-  </tr>
-  {% endfor %}
-</table>
+{% set doc_id = doc.document_id %}
+<div class="doc-card">
+  <div class="doc-card-header">
+    <span class="doc-title">
+      {{ doc.document_type.value if doc.document_type.value is defined else doc.document_type }}
+      &nbsp;—&nbsp; {{ doc.document_name or doc_id }}
+    </span>
+    <span class="doc-meta">{{ doc_id }}</span>
+  </div>
+
+  {# Verification status row #}
+  <div class="doc-verify-row">
+    <span>
+      Verification:
+      {% if doc.verification_passed %}
+        <span class="badge APPROVE">PASSED</span>
+      {% else %}
+        <span class="badge DECLINE">FAILED</span>
+      {% endif %}
+    </span>
+    {% if doc.verification_confidence is not none %}
+    <span>
+      Confidence:
+      {% set pct = (doc.verification_confidence * 100) | int %}
+      <span class="conf-wrap">
+        <span class="conf-bar"><span class="conf-fill {% if pct >= 80 %}conf-high{% elif pct >= 60 %}conf-med{% else %}conf-low{% endif %}" style="width:{{ pct }}%;"></span></span>
+        {{ pct }}%
+      </span>
+    </span>
+    {% endif %}
+  </div>
+
+  <div class="doc-body">
+    {# Left: document image/preview #}
+    <div class="doc-preview">
+      {% if doc_id in doc_data_uris %}
+        {% set ctype = doc_content_types.get(doc_id, '') %}
+        {% if 'image' in ctype %}
+          <img src="{{ doc_data_uris[doc_id] }}" alt="Document preview">
+        {% else %}
+          <div class="no-preview">Preview not available<br><small>{{ ctype }}</small></div>
+        {% endif %}
+      {% else %}
+        <div class="no-preview">Document not available</div>
+      {% endif %}
+    </div>
+
+    {# Right: extracted fields #}
+    <div class="doc-fields">
+      {% if doc.extracted_data %}
+      <table>
+        <thead><tr><th>Field</th><th>Extracted Value</th><th>Confidence</th><th>Page</th></tr></thead>
+        <tbody>
+        {% for label, ef in doc.extracted_data.items() %}
+        <tr>
+          <td>{{ ef.normalized_label }}</td>
+          <td>{{ ef.value }}</td>
+          <td>
+            {% if ef.confidence is not none %}
+            {% set p = (ef.confidence * 100) | int %}
+            <span class="conf-wrap">
+              <span class="conf-bar"><span class="conf-fill {% if p >= 80 %}conf-high{% elif p >= 60 %}conf-med{% else %}conf-low{% endif %}" style="width:{{ p }}%;"></span></span>
+              {{ p }}%
+            </span>
+            {% else %}—{% endif %}
+          </td>
+          <td>{{ ef.page_reference or '—' }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div style="padding: 24px; text-align: center; color: #9ca3af; font-size: 9pt;">
+        No fields extracted — document verification failed or type mismatch.
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
 {% endfor %}
 
-<h2>Validation Results</h2>
+{# ── Validation Checks ─────────────────────────────────────────────── #}
+{# Extracted/expected values are folded into the Description cell to keep
+   the table to 4 columns and prevent horizontal overflow in the PDF.   #}
+<div class="section-title">Validation Checks</div>
 <table>
-  <tr><th>Rule</th><th>Outcome</th><th>Description</th><th>Field</th><th>Extracted</th><th>Expected</th></tr>
+  <thead>
+    <tr>
+      <th style="width:22%">Rule</th>
+      <th style="width:16%">Outcome</th>
+      <th>Finding</th>
+      <th style="width:9%">Conf.</th>
+    </tr>
+  </thead>
+  <tbody>
   {% for r in validation_results %}
   <tr>
-    <td>{{ r.rule_code }}</td>
-    <td><span class="badge {{ r.outcome }}">{{ r.outcome }}</span></td>
-    <td>{{ r.description }}</td>
-    <td>{{ r.field_name or '' }}</td>
-    <td>{{ r.extracted_value or '' }}</td>
-    <td>{{ r.expected_value or '' }}</td>
+    <td style="font-size:8pt; font-family:monospace;">{{ r.rule_code }}</td>
+    <td><span class="badge {{ r.outcome }}">{{ r.outcome.replace('_', ' ') }}</span></td>
+    <td>
+      {{ r.description }}
+      {% if r.field_name or r.extracted_value is not none or r.expected_value is not none %}
+      <div style="font-size:8.5pt; color:#6b7280; margin-top:3px; line-height:1.4;">
+        {% if r.field_name %}Field: <strong>{{ r.field_name }}</strong>{% endif %}
+        {% if r.extracted_value is not none %}
+          &nbsp;·&nbsp; Extracted: <strong>{{ r.extracted_value }}</strong>
+        {% endif %}
+        {% if r.expected_value is not none %}
+          &nbsp;·&nbsp; Expected: <strong>{{ r.expected_value }}</strong>
+        {% endif %}
+      </div>
+      {% endif %}
+    </td>
+    <td>{% if r.confidence is not none %}{{ (r.confidence * 100) | int }}%{% else %}—{% endif %}</td>
   </tr>
   {% endfor %}
+  </tbody>
 </table>
 
-<h2>Analyst Narrative</h2>
-<div class="narrative">{{ narrative }}</div>
+{# ── Manual Checks ─────────────────────────────────────────────────── #}
+{% if manual_check_items or document_results %}
+<div class="section-title">Manual Checks Required</div>
+<table>
+  <thead><tr><th style="width:28%">Check</th><th>Description</th><th style="width:28%">Reference</th></tr></thead>
+  <tbody>
+  {% for m in manual_check_items %}
+  <tr>
+    <td style="font-size:8pt; font-family:monospace;">{{ m.rule_code }}</td>
+    <td>{{ m.description }}</td>
+    <td>{{ m.field_name or '—' }}</td>
+  </tr>
+  {% endfor %}
+  {% for doc in document_results %}
+  <tr>
+    <td style="font-size:8pt; font-family:monospace;">STAMP_AND_SIGNATURE_REVIEW</td>
+    <td>Visual confirmation of stamp and signature. The system does not render this verdict.</td>
+    <td>{{ doc.document_type }} — {{ doc.document_name }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# ── Technical Exceptions ──────────────────────────────────────────── #}
+{% if technical_exceptions %}
+<div class="section-title">Technical Exceptions</div>
+<div class="tech-banner">
+  The items below are integration or extraction failures — <strong>not</strong> business decisions.
+  They require investigation independent of the recommendation.
+</div>
+<table>
+  <tbody>
+  {% for t in technical_exceptions %}
+  <tr class="tech-row">
+    <td style="width:20%;"><span class="tech-badge">{{ t.kind }}</span></td>
+    <td>{{ t.description }}</td>
+    <td>{{ t.reference or '' }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# ── Footer ────────────────────────────────────────────────────────── #}
+<div class="page-footer">
+  <span>Config v{{ config_version or '—' }}{% if employer_snapshot %} · Employer rules v{{ employer_snapshot.rule_version }}{% endif %}</span>
+</div>
 
 </body>
 </html>

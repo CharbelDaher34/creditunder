@@ -44,14 +44,12 @@ SPAN_PROCESS_EVENT = "pipeline.process_event"
 SPAN_PROCESS_CASE = "pipeline.process_case"
 SPAN_PROCESS_DOCUMENT = "pipeline.process_document"
 SPAN_GENERATE_REPORT = "pipeline.generate_report"
-SPAN_EXPORT_EDW = "pipeline.export_edw"
 
 # External-call spans
 SPAN_DMS_FETCH = "dms.fetch_document"
 SPAN_DMS_UPLOAD = "dms.upload_document"
 SPAN_AI_VERIFY_AND_EXTRACT = "ai.verify_and_extract"
 SPAN_AI_GENERATE_NARRATIVE = "ai.generate_narrative"
-SPAN_EDW_EXPORT = "edw.export"
 
 # Counters
 COUNTER_EVENTS_CONSUMED = "creditunder.events_consumed"
@@ -67,7 +65,6 @@ COUNTER_DEAD_LETTER = "creditunder.dead_letter_events"
 HISTOGRAM_PIPELINE_MS = "creditunder.pipeline.duration_ms"
 HISTOGRAM_AI_CALL_MS = "creditunder.ai.call_duration_ms"
 HISTOGRAM_DMS_CALL_MS = "creditunder.dms.call_duration_ms"
-HISTOGRAM_EDW_CALL_MS = "creditunder.edw.call_duration_ms"
 
 
 class Telemetry:
@@ -284,11 +281,6 @@ class Telemetry:
             HISTOGRAM_DMS_CALL_MS,
             duration_ms,
             {"direction": direction, "success": str(success).lower()},
-        )
-
-    def record_edw_export(self, duration_ms: float, success: bool) -> None:
-        self.histogram(
-            HISTOGRAM_EDW_CALL_MS, duration_ms, {"success": str(success).lower()}
         )
 
     def record_dead_letter(self, reason_code: str) -> None:

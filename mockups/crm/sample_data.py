@@ -6,6 +6,20 @@ Document IDs reference documents pre-seeded in the DMS mockup.
 import uuid
 
 
+# Common employer snapshot — CRM resolves the employer against the governed
+# rules source at submission time and embeds the snapshot in the event so
+# the processor never needs to fetch it.
+_ARAMCO_EMPLOYER_SNAPSHOT = {
+    "employer_id": "EMP-ARAMCO",
+    "employer_name_normalized": "SAUDI ARAMCO",
+    "employer_class": "A",
+    "active_restrictions": [],
+    "max_limit_note": None,
+    "rule_version": "2026.04",
+    "rule_source_date": "2026-04-15",
+}
+
+
 SAMPLE_EVENTS = [
     {
         "event_id": str(uuid.uuid4()),
@@ -26,6 +40,7 @@ SAMPLE_EVENTS = [
             "t24_account_id": "T24-ACC-998821",
             "requested_amount": 150000.00,
             "requested_tenure_months": 60,
+            "employer_snapshot": _ARAMCO_EMPLOYER_SNAPSHOT,
         },
     },
     # Second event: salary mismatch scenario
@@ -48,6 +63,7 @@ SAMPLE_EVENTS = [
             "t24_account_id": "T24-ACC-112233",
             "requested_amount": 200000.00,
             "requested_tenure_months": 84,
+            "employer_snapshot": _ARAMCO_EMPLOYER_SNAPSHOT,
         },
     },
 ]

@@ -8,8 +8,9 @@ from uuid import UUID
 import structlog
 from aiokafka import AIOKafkaConsumer
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from creditunder.config import settings
 from creditunder.db.models import (
@@ -20,7 +21,7 @@ from creditunder.db.models import (
     CaseResultRow,
     DeadLetterEvent,
     DMSArtifact,
-    EDWStaging,
+    EdwStaging,
     InboundApplicationEvent,
     ProcessingJob,
     StageOutputVersion,
@@ -32,7 +33,6 @@ from creditunder.domain.enums import (
     CaseStatus,
     DocumentStatus,
     DocumentType,
-    EDWStatus,
     InboundEventStatus,
     JobStatus,
     JobType,
@@ -47,7 +47,6 @@ from creditunder.handlers.registry import get_handler
 from creditunder.pipeline.report_generator import ReportGenerator
 from creditunder.services.ai_client import AIClient
 from creditunder.services.dms_client import DMSClient
-from creditunder.services.edw_client import EDWClient
 
 log = structlog.get_logger(__name__)
 
@@ -58,7 +57,6 @@ _TIMEOUT_DMS_FETCH = 10.0
 _TIMEOUT_AI_VERIFY_AND_EXTRACT = 25.0
 _TIMEOUT_AI_NARRATIVE = 20.0
 _TIMEOUT_DMS_UPLOAD = 10.0
-_TIMEOUT_EDW_EXPORT = 30.0
 
 _MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY = 1.0  # exponential: 1s, 2s, 4s
@@ -80,10 +78,8 @@ class ApplicationProcessor:
             base_url=settings.effective_ai_base_url,
             api_key=settings.effective_ai_api_key,
             model=settings.ai_model,
-            confidence_threshold=settings.ai_confidence_threshold,
         )
         self._dms = DMSClient(settings.dms_base_url)
-        self._edw = EDWClient(settings.edw_base_url)
         self._report_gen = ReportGenerator(self._ai, self._dms)
 
     # ------------------------------------------------------------------ #
@@ -325,7 +321,10 @@ class ApplicationProcessor:
         document_results: list[DocumentResult] = [r for r in results if r is not None]
 
         # Completeness check — required document types must be represented.
-        missing = set(handler.required_documents) - {dr.document_type for dr in document_results}
+        # The handler resolves the required set from applicant_data so that
+        # employer-class-driven document matrices (BR-13/BR-14) are honoured.
+        required_set = handler.required_documents(event.applicant_data)
+        missing = required_set.required - {dr.document_type for dr in document_results}
         if missing:
             await self._handle_missing_documents(event, case_id, missing)
             return
@@ -360,17 +359,11 @@ class ApplicationProcessor:
             completed_at=completed_at,
         )
 
-        # Run report generation and EDW export INDEPENDENTLY. A failure in
-        # one must not block the other — both produce outputs the bank needs
-        # and both have their own retry path keyed off persisted state.
-        report_ok = await self._generate_and_deliver_report(event, case_id, case_result)
-        edw_ok = await self._export_to_edw(event, case_id, case_result)
+        report_ok = await self._generate_and_deliver_report(
+            event, case_id, case_result, required_set
+        )
 
-        # Only set the pipeline-level completed_at when delivery is fully
-        # done. Partial-delivery cases stay at completed_at = NULL with errors
-        # captured on case_report.error_detail / edw_staging.export_error so
-        # ops can see exactly what is outstanding.
-        if report_ok and edw_ok:
+        if report_ok:
             now = datetime.now(timezone.utc)
             async with AsyncSessionLocal() as session:
                 await session.execute(
@@ -387,6 +380,21 @@ class ApplicationProcessor:
                     actor=_ACTOR,
                 )
                 await session.commit()
+
+            # Write the denormalised workbench snapshot. All upstream writes
+            # (validation rows, case status, report upload, completed_at) are
+            # committed above, so the snapshot is consistent. We catch
+            # SQLAlchemy errors (replication/connection issues) and let
+            # everything else propagate so programming errors surface in dev.
+            try:
+                await self._write_edw_staging(event.application_id, case_id, now)
+            except SQLAlchemyError as exc:
+                log.error(
+                    "edw_staging.write_failed",
+                    application_id=event.application_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
             log.info(
                 "case.completed",
                 application_id=event.application_id,
@@ -397,7 +405,6 @@ class ApplicationProcessor:
                 "case.completed_with_delivery_errors",
                 application_id=event.application_id,
                 report_ok=report_ok,
-                edw_ok=edw_ok,
             )
 
     async def _handle_missing_documents(
@@ -461,6 +468,9 @@ class ApplicationProcessor:
                     expected_value=exp_str,
                     confidence=vr.confidence,
                     manual_review_required=is_manual,
+                    rule_version=vr.rule_version,
+                    employer_rule_version=vr.employer_rule_version,
+                    config_version=vr.config_version,
                 ))
 
             session.add(CaseResultRow(
@@ -471,8 +481,8 @@ class ApplicationProcessor:
             ))
 
             # Mark the case COMPLETED — business processing is done. Delivery
-            # state (report upload, EDW export) is tracked separately on
-            # case_report and edw_staging. application_case.completed_at is
+            # state (report upload) is tracked separately on case_report.
+            # application_case.completed_at is
             # only set later, once delivery succeeds.
             await session.execute(
                 update(ApplicationCase).where(ApplicationCase.id == case_id).values(
@@ -713,7 +723,11 @@ class ApplicationProcessor:
     # ------------------------------------------------------------------ #
 
     async def _generate_and_deliver_report(
-        self, event: ApplicationEvent, case_id: UUID, case_result: CaseResult
+        self,
+        event: ApplicationEvent,
+        case_id: UUID,
+        case_result: CaseResult,
+        required_set,
     ) -> bool:
         """Returns True iff HTML+PDF were produced AND uploaded to DMS."""
         async with AsyncSessionLocal() as session:
@@ -732,6 +746,7 @@ class ApplicationProcessor:
                     applicant_data=event.applicant_data,
                     branch_name=event.branch_name,
                     validator_id=event.validator_id,
+                    required_documents=required_set,
                 ),
                 timeout=_TIMEOUT_AI_NARRATIVE + 10.0,  # narrative + rendering budget
             )
@@ -790,21 +805,16 @@ class ApplicationProcessor:
                 # Status stays at PDF_READY but moves to FAILED with
                 # error_detail set — the HTML and PDF are persisted, so
                 # the upload can be retried independently from the staging
-                # state without re-running the pipeline.
+                # state without re-running the pipeline. The failure is
+                # already recorded on processing_job.last_error; we don't
+                # write a sentinel DMSArtifact row because dms_document_id
+                # is NOT NULL and there is no document id to record.
                 await session.execute(
                     update(CaseReport).where(CaseReport.id == report_id).values(
                         status=CaseReportStatus.FAILED,
                         error_detail=f"DMS upload failed: {error_msg}",
                     )
                 )
-                session.add(DMSArtifact(
-                    case_id=case_id,
-                    dms_document_id="",
-                    artifact_type="PDF_REPORT",
-                    direction="OUTBOUND",
-                    status="FAILED",
-                    error_details={"error": error_msg},
-                ))
                 await session.commit()
             return False
 
@@ -833,89 +843,251 @@ class ApplicationProcessor:
         return True
 
     # ------------------------------------------------------------------ #
-    #  EDW export                                                           #
+    #  EDW staging                                                          #
     # ------------------------------------------------------------------ #
 
-    async def _export_to_edw(
-        self, event: ApplicationEvent, case_id: UUID, case_result: CaseResult
-    ) -> bool:
-        """Returns True iff the EDW write was confirmed."""
-        rec_str = _enum_val(case_result.recommendation)
-        payload = {
-            "application_id": event.application_id,
-            "event_id": str(event.event_id),
-            "product_type": _enum_val(event.product_type),
-            "branch_name": event.branch_name,
-            "validator_id": event.validator_id,
-            "supervisor_id": event.supervisor_id,
-            "applicant_data": event.applicant_data,
-            "recommendation": rec_str,
-            "recommendation_rationale": case_result.recommendation_rationale,
-            "manual_review_required": case_result.manual_review_required,
-            "validation_results": [
-                {
-                    "rule_code": vr.rule_code,
-                    "outcome": _enum_val(vr.outcome),
-                    "description": vr.description,
-                    "field_name": vr.field_name,
-                }
-                for vr in case_result.validation_results
-            ],
-            "exported_at": datetime.now(timezone.utc).isoformat(),
-        }
+    async def _write_edw_staging(
+        self,
+        application_id: str,
+        case_id: UUID,
+        completed_at: datetime,
+    ) -> None:
+        """Build and persist the full denormalised workbench snapshot.
 
+        Queries all pipeline rows for the case (all committed by the time
+        this runs) and writes a single EdwStaging row. The workbench reads
+        only from this table — it never touches the pipeline tables directly.
+        """
         async with AsyncSessionLocal() as session:
-            staging = EDWStaging(case_id=case_id, payload=payload, status=EDWStatus.STAGED)
-            session.add(staging)
-            await session.flush()
-            staging_id = staging.id
-            await session.commit()
-
-        try:
-            confirmation_id = await self._run_with_job(
-                case_id=case_id,
-                job_type=JobType.EDW_WRITE,
-                coro_fn=lambda: self._edw.export(payload),
-                timeout=_TIMEOUT_EDW_EXPORT,
+            case_row = await session.scalar(
+                select(ApplicationCase).where(ApplicationCase.id == case_id)
             )
-        except Exception as exc:
-            error_msg = f"{type(exc).__name__}: {exc}"
-            log.error(
-                "edw.export_failed",
-                application_id=event.application_id,
-                error=error_msg,
-            )
-            # The case stays at status COMPLETED (business processing done).
-            # The staging row records the failure for independent retry —
-            # the staging payload is the full settled output, so the retry
-            # does not re-run the pipeline.
-            async with AsyncSessionLocal() as session:
+            doc_rows = (
                 await session.execute(
-                    update(EDWStaging).where(EDWStaging.id == staging_id).values(
-                        status=EDWStatus.EXPORT_FAILED,
-                        export_error=error_msg,
-                    )
+                    select(CaseDocument)
+                    .where(CaseDocument.case_id == case_id)
+                    .options(selectinload(CaseDocument.extraction_versions))
                 )
-                await session.commit()
-            return False
+            ).scalars().all()
+            val_rows = (
+                await session.execute(
+                    select(ValidationResultRow).where(ValidationResultRow.case_id == case_id)
+                )
+            ).scalars().all()
+            audit_rows = (
+                await session.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.case_id == case_id)
+                    .order_by(AuditEvent.occurred_at.asc())
+                )
+            ).scalars().all()
+            report_row = await session.scalar(
+                select(CaseReport).where(CaseReport.case_id == case_id)
+            )
 
-        now = datetime.now(timezone.utc)
-        async with AsyncSessionLocal() as session:
-            await session.execute(
-                update(EDWStaging).where(EDWStaging.id == staging_id).values(
-                    status=EDWStatus.EXPORTED,
-                    edw_confirmation_id=confirmation_id,
-                    exported_at=now,
-                    export_error=None,
-                )
-            )
-            await self._audit(
-                session, case_id, event.application_id, "EDW_EXPORTED",
-                {"edw_confirmation_id": confirmation_id},
-                actor=_ACTOR,
-            )
-            await session.commit()
-        return True
+            applicant_data = case_row.applicant_data or {}
+            if not isinstance(applicant_data, dict):
+                applicant_data = {}
+            applicant_name_val = applicant_data.get("name")
+            employer_snapshot = applicant_data.get("employer_snapshot")
+
+            # --- documents ------------------------------------------------
+            documents = []
+            for d in doc_rows:
+                if d.extraction_versions:
+                    latest = max(d.extraction_versions, key=lambda v: v.version)
+                    raw = latest.raw_extraction or {}
+                    extracted_fields = [
+                        {
+                            "label": ef.get("normalized_label") or key,
+                            "value": ef.get("value"),
+                            "confidence": ef.get("confidence"),
+                            "page_reference": ef.get("page_reference"),
+                        }
+                        for key, ef in raw.items()
+                        if isinstance(ef, dict)
+                    ]
+                else:
+                    extracted_fields = []
+                documents.append({
+                    "id": str(d.id),
+                    "dms_document_id": d.dms_document_id,
+                    "document_name": d.document_name,
+                    "document_type": d.document_type,
+                    "status": d.status,
+                    "verification_passed": d.verification_passed,
+                    "verification_confidence": d.verification_confidence,
+                    "fetched_at": d.fetched_at.isoformat() if d.fetched_at else None,
+                    "verified_at": d.verified_at.isoformat() if d.verified_at else None,
+                    "error_detail": d.error_detail,
+                    "extracted_fields": extracted_fields,
+                })
+
+            # --- validations (pre-grouped) --------------------------------
+            valids: dict[str, list] = {
+                "hard_breach": [], "soft_mismatch": [],
+                "low_confidence": [], "manual_review": [],
+            }
+            for v in val_rows:
+                entry = {
+                    "id": str(v.id),
+                    "rule_code": v.rule_code,
+                    "outcome": v.outcome,
+                    "description": v.description,
+                    "field_name": v.field_name,
+                    "extracted_value": v.extracted_value,
+                    "expected_value": v.expected_value,
+                    "confidence": v.confidence,
+                    "manual_review_required": v.manual_review_required,
+                    "rule_version": v.rule_version,
+                    "employer_rule_version": v.employer_rule_version,
+                    "config_version": v.config_version,
+                    "evaluated_at": v.evaluated_at.isoformat() if v.evaluated_at else None,
+                }
+                match v.outcome:
+                    case "HARD_BREACH":
+                        valids["hard_breach"].append(entry)
+                    case "SOFT_MISMATCH":
+                        valids["soft_mismatch"].append(entry)
+                    case "LOW_CONFIDENCE":
+                        valids["low_confidence"].append(entry)
+                    case "MANUAL_REVIEW_REQUIRED":
+                        valids["manual_review"].append(entry)
+
+            # --- manual checks --------------------------------------------
+            manual_checks = []
+            seen_codes: set[str] = set()
+            for v in val_rows:
+                if not (v.manual_review_required or v.outcome == "MANUAL_REVIEW_REQUIRED"):
+                    continue
+                if v.rule_code in seen_codes:
+                    continue
+                seen_codes.add(v.rule_code)
+                manual_checks.append({
+                    "rule_code": v.rule_code,
+                    "description": v.description,
+                    "field_name": v.field_name,
+                    "reference": None,
+                    "kind": "RULE",
+                })
+            for d in doc_rows:
+                manual_checks.append({
+                    "rule_code": "STAMP_AND_SIGNATURE_REVIEW",
+                    "description": (
+                        "Visual confirmation of stamp and signature against the "
+                        "reference record. The system does not render this verdict."
+                    ),
+                    "field_name": None,
+                    "reference": (
+                        f"{d.document_type or '—'} — {d.document_name or d.dms_document_id}"
+                    ),
+                    "kind": "STAMP_AND_SIGNATURE",
+                })
+
+            # --- technical exceptions -------------------------------------
+            tech_exceptions = []
+            if case_row.error_detail:
+                tech_exceptions.append({
+                    "kind": "PIPELINE_FAILURE",
+                    "description": case_row.error_detail,
+                    "reference": f"case status: {case_row.status}",
+                })
+            for d in doc_rows:
+                if d.error_detail:
+                    tech_exceptions.append({
+                        "kind": "DOCUMENT_FAILURE",
+                        "description": d.error_detail,
+                        "reference": f"{d.document_type or '—'} — {d.dms_document_id}",
+                    })
+            if report_row and report_row.error_detail:
+                tech_exceptions.append({
+                    "kind": "REPORT_FAILURE",
+                    "description": report_row.error_detail,
+                    "reference": f"report status: {report_row.status}",
+                })
+
+            # --- audit timeline ------------------------------------------
+            audit_timeline = [
+                {
+                    "id": str(a.id),
+                    "event_type": a.event_type,
+                    "actor": a.actor,
+                    "detail": a.detail,
+                    "occurred_at": a.occurred_at.isoformat() if a.occurred_at else None,
+                }
+                for a in audit_rows
+            ]
+
+            # --- full payload --------------------------------------------
+            payload = {
+                "case": {
+                    "id": str(case_row.id),
+                    "application_id": case_row.application_id,
+                    "applicant_name": applicant_name_val,
+                    "product_type": case_row.product_type,
+                    "branch_name": case_row.branch_name,
+                    "validator_id": case_row.validator_id,
+                    "supervisor_id": case_row.supervisor_id,
+                    "status": case_row.status,
+                    "recommendation": case_row.recommendation,
+                    "recommendation_rationale": case_row.recommendation_rationale,
+                    "manual_review_required": case_row.manual_review_required,
+                    "error_detail": case_row.error_detail,
+                    "applicant_data": applicant_data,
+                    "created_at": (
+                        case_row.created_at.isoformat() if case_row.created_at else None
+                    ),
+                    "updated_at": completed_at.isoformat(),
+                    "completed_at": completed_at.isoformat(),
+                },
+                "employer_snapshot": employer_snapshot,
+                "documents": documents,
+                "validations": valids,
+                "manual_checks": manual_checks,
+                "technical_exceptions": tech_exceptions,
+                "report": {
+                    "status": report_row.status if report_row else None,
+                    "pdf_available": bool(report_row and report_row.pdf_dms_document_id),
+                    "pdf_uploaded_at": (
+                        report_row.pdf_uploaded_at.isoformat()
+                        if report_row and report_row.pdf_uploaded_at
+                        else None
+                    ),
+                    "error_detail": report_row.error_detail if report_row else None,
+                },
+                "audit_timeline": audit_timeline,
+            }
+
+            pdf_dms_doc_id = report_row.pdf_dms_document_id if report_row else None
+
+            try:
+                session.add(EdwStaging(
+                    case_id=case_id,
+                    application_id=case_row.application_id,
+                    validator_id=case_row.validator_id,
+                    supervisor_id=case_row.supervisor_id,
+                    product_type=case_row.product_type,
+                    branch_name=case_row.branch_name,
+                    applicant_name=applicant_name_val,
+                    status=case_row.status,
+                    recommendation=case_row.recommendation,
+                    manual_review_required=case_row.manual_review_required,
+                    pdf_dms_document_id=pdf_dms_doc_id,
+                    error_detail=case_row.error_detail,
+                    created_at=case_row.created_at,
+                    updated_at=completed_at,
+                    completed_at=completed_at,
+                    payload=payload,
+                    export_status="STAGED",
+                    staged_at=datetime.now(timezone.utc),
+                ))
+                await session.commit()
+            except IntegrityError:
+                await session.rollback()
+                log.warning("edw_staging.already_exists", application_id=application_id)
+                return
+
+        log.info("edw_staging.written", application_id=application_id)
 
     # ------------------------------------------------------------------ #
     #  Failure helpers                                                      #
@@ -964,6 +1136,9 @@ class ApplicationProcessor:
             job_id = job.id
             await session.commit()
 
+        if max_attempts < 1:
+            raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+
         last_exc: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
@@ -1001,8 +1176,10 @@ class ApplicationProcessor:
                 if not is_last:
                     await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
 
-        assert last_exc is not None  # loop runs at least once
-        raise last_exc
+        # last_exc is guaranteed non-None: max_attempts >= 1 so the loop body
+        # ran at least once, and the only way to exit without `return`-ing is
+        # via the except branch, which always assigns last_exc.
+        raise last_exc  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     #  Helpers                                                              #

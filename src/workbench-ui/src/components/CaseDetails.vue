@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { apiGet, apiBlob } from '../api'
 
 interface ExtractedField { label: string; value: any; confidence: number | null; page_reference: number | null }
@@ -30,13 +30,11 @@ interface Validations {
 }
 interface AuditEntry { id: string; event_type: string; actor: string | null; detail: any; occurred_at: string }
 interface Report { status: string | null; pdf_available: boolean; pdf_uploaded_at: string | null; error_detail: string | null }
-interface EDW { status: string | null; edw_confirmation_id: string | null; exported_at: string | null; export_error: string | null }
 interface CaseDetail {
   case: any
   documents: Doc[]
   validations: Validations
   report: Report
-  edw: EDW
   audit_timeline: AuditEntry[]
 }
 
@@ -48,6 +46,28 @@ const loading = ref(true)
 const error = ref<string | null>(null)
 const activeTab = ref<'overview' | 'documents' | 'validations' | 'timeline'>('overview')
 
+// document preview: keyed by dms_document_id → { url, contentType } | 'loading' | 'error'
+const docPreviews = ref<Record<string, { url: string; contentType: string } | 'loading' | 'error'>>({})
+
+async function loadDocPreviews() {
+  if (!data.value) return
+  for (const d of data.value.documents) {
+    if (docPreviews.value[d.dms_document_id]) continue
+    docPreviews.value[d.dms_document_id] = 'loading'
+    try {
+      const blob = await apiBlob(`/api/v1/cases/${props.caseId}/documents/${d.dms_document_id}/preview`)
+      const url = URL.createObjectURL(blob)
+      docPreviews.value[d.dms_document_id] = { url, contentType: blob.type }
+    } catch {
+      docPreviews.value[d.dms_document_id] = 'error'
+    }
+  }
+}
+
+watch(activeTab, (tab) => {
+  if (tab === 'documents') loadDocPreviews()
+})
+
 const validationCount = computed(() => {
   if (!data.value) return 0
   const v = data.value.validations
@@ -57,6 +77,7 @@ const validationCount = computed(() => {
 onMounted(async () => {
   try {
     data.value = await apiGet<CaseDetail>(`/api/v1/cases/${props.caseId}`)
+    if (activeTab.value === 'documents') loadDocPreviews()
   } catch (e: any) {
     error.value = e.message || 'Failed to load case.'
   } finally {
@@ -94,12 +115,6 @@ function reportChip(s: string | null) {
   if (s === 'FAILED') return 'chip-danger'
   return 'chip-info'
 }
-function edwChip(s: string | null) {
-  if (!s) return 'chip-neutral'
-  if (s === 'EXPORTED') return 'chip-success'
-  if (s === 'EXPORT_FAILED') return 'chip-danger'
-  return 'chip-info'
-}
 function outcomeChip(o: string) {
   if (o === 'HARD_BREACH') return 'chip-danger'
   if (o === 'SOFT_MISMATCH') return 'chip-warning'
@@ -123,7 +138,7 @@ function confKlass(c: number | null) {
 function tlClass(eventType: string) {
   if (eventType.includes('FAILED') || eventType === 'CASE_FAILED' || eventType === 'DOCUMENT_TYPE_MISMATCH') return 'tl-danger'
   if (eventType === 'MISSING_REQUIRED_DOCUMENTS') return 'tl-warning'
-  if (eventType === 'CASE_COMPLETED' || eventType === 'EDW_EXPORTED' || eventType === 'REPORT_UPLOADED') return 'tl-success'
+  if (eventType === 'CASE_COMPLETED' || eventType === 'REPORT_UPLOADED') return 'tl-success'
   return ''
 }
 function eventTitle(t: string) {
@@ -218,10 +233,6 @@ function detailString(d: any): string {
               <span class="chip" :class="reportChip(data.report.status)">{{ data.report.status ?? 'PENDING' }}</span>
             </div>
             <div class="status-pill">
-              <span class="muted">EDW</span>
-              <span class="chip" :class="edwChip(data.edw.status)">{{ data.edw.status ?? '—' }}</span>
-            </div>
-            <div class="status-pill">
               <span class="muted">Submitted</span>
               <span class="mono">{{ fmtDateTime(data.case.created_at) }}</span>
             </div>
@@ -244,12 +255,6 @@ function detailString(d: any): string {
             <div>
               <div class="alert-title">Report delivery failed</div>
               <div class="mono" style="margin-top: 4px;">{{ data.report.error_detail }}</div>
-            </div>
-          </div>
-          <div v-if="data.edw.status === 'EXPORT_FAILED' && data.edw.export_error" class="alert alert-warning">
-            <div>
-              <div class="alert-title">EDW export failed</div>
-              <div class="mono" style="margin-top: 4px;">{{ data.edw.export_error }}</div>
             </div>
           </div>
         </div>
@@ -293,74 +298,122 @@ function detailString(d: any): string {
         </section>
 
         <!-- DOCUMENTS -->
-        <section v-else-if="activeTab === 'documents'" class="panel panel-pad" style="padding: 0;">
-          <div v-if="data.documents.length === 0" class="empty-mini">No documents recorded.</div>
-          <article v-for="d in data.documents" :key="d.id" class="doc">
-            <header class="doc-head">
-              <div>
-                <div class="doc-name">{{ d.document_name || d.dms_document_id }}</div>
-                <div class="muted mono" style="font-size: 12px;">
-                  {{ d.dms_document_id }} · {{ d.document_type ?? 'unknown type' }}
+        <section v-else-if="activeTab === 'documents'" style="display: flex; flex-direction: column; gap: 16px;">
+          <div v-if="data.documents.length === 0" class="panel panel-pad empty-mini">No documents recorded.</div>
+
+          <article v-for="d in data.documents" :key="d.id" class="doc-card panel">
+            <!-- Card header -->
+            <header class="doc-card-header">
+              <div style="display: flex; align-items: center; gap: 14px; min-width: 0;">
+                <div style="min-width: 0;">
+                  <div class="doc-name truncate">{{ d.document_name || d.dms_document_id }}</div>
+                  <div class="muted mono" style="font-size: 11px; margin-top: 2px;">
+                    {{ d.dms_document_id }} &nbsp;·&nbsp; {{ d.document_type ?? 'unknown type' }}
+                  </div>
                 </div>
               </div>
-              <div class="doc-status">
+              <div style="display: flex; align-items: center; gap: 12px; flex-shrink: 0;">
                 <span v-if="d.verification_passed === true" class="chip chip-success chip-dot">VERIFIED</span>
                 <span v-else-if="d.verification_passed === false" class="chip chip-danger chip-dot">MISMATCH</span>
                 <span v-else class="chip chip-neutral">{{ d.status }}</span>
                 <span v-if="d.verification_confidence != null" class="confbar">
                   <span class="confbar-track">
-                    <span
-                      class="confbar-fill"
-                      :class="confKlass(d.verification_confidence)"
-                      :style="{ width: (d.verification_confidence * 100).toFixed(0) + '%' }"
-                    ></span>
+                    <span class="confbar-fill" :class="confKlass(d.verification_confidence)"
+                      :style="{ width: (d.verification_confidence * 100).toFixed(0) + '%' }"></span>
                   </span>
-                  <span class="muted" style="font-size: 12px;">{{ (d.verification_confidence * 100).toFixed(0) }}%</span>
+                  <span class="muted" style="font-size: 12px;">
+                    {{ (d.verification_confidence * 100).toFixed(0) }}%
+                  </span>
                 </span>
               </div>
             </header>
 
-            <div v-if="d.error_detail" class="alert alert-danger" style="margin: 4px 0 12px;">
+            <div v-if="d.error_detail" class="alert alert-danger" style="margin: 10px 0 0;">
               <div>
                 <div class="alert-title">Document error</div>
                 <div class="mono" style="margin-top: 4px;">{{ d.error_detail }}</div>
               </div>
             </div>
 
-            <div v-if="d.extracted_fields.length > 0" class="doc-fields">
-              <div class="doc-fields-head">Extracted Fields</div>
-              <table class="table mini">
-                <thead>
-                  <tr>
-                    <th style="width: 35%;">Field</th>
-                    <th>Value</th>
-                    <th style="width: 140px;">Confidence</th>
-                    <th style="width: 60px;">Page</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="f in d.extracted_fields" :key="f.label">
-                    <td>{{ f.label }}</td>
-                    <td class="mono">{{ f.value ?? '—' }}</td>
-                    <td>
-                      <span v-if="f.confidence != null" class="confbar">
-                        <span class="confbar-track">
-                          <span
-                            class="confbar-fill"
-                            :class="confKlass(f.confidence)"
-                            :style="{ width: (f.confidence * 100).toFixed(0) + '%' }"
-                          ></span>
-                        </span>
-                        <span class="muted" style="font-size: 12px;">{{ (f.confidence * 100).toFixed(0) }}%</span>
+            <!-- Split: preview left, fields right -->
+            <div class="doc-split">
+              <!-- Document preview -->
+              <div class="doc-preview-col">
+                <div class="doc-preview-label">Document</div>
+                <div class="doc-preview-frame">
+                  <template v-if="docPreviews[d.dms_document_id] === 'loading'">
+                    <div class="doc-preview-placeholder">
+                      <span class="muted" style="font-size: 12px;">Loading…</span>
+                    </div>
+                  </template>
+                  <template v-else-if="docPreviews[d.dms_document_id] === 'error'">
+                    <div class="doc-preview-placeholder">
+                      <span class="muted" style="font-size: 12px;">Preview unavailable</span>
+                    </div>
+                  </template>
+                  <template v-else-if="docPreviews[d.dms_document_id]">
+                    <img
+                      v-if="docPreviews[d.dms_document_id].contentType.startsWith('image/')"
+                      :src="docPreviews[d.dms_document_id].url"
+                      class="doc-preview-img"
+                      :alt="d.document_name || d.dms_document_id"
+                    />
+                    <iframe
+                      v-else-if="docPreviews[d.dms_document_id].contentType === 'application/pdf'"
+                      :src="docPreviews[d.dms_document_id].url"
+                      class="doc-preview-pdf"
+                    ></iframe>
+                    <div v-else class="doc-preview-placeholder">
+                      <span class="muted" style="font-size: 12px;">
+                        {{ docPreviews[d.dms_document_id].contentType }}
                       </span>
-                      <span v-else class="muted">—</span>
-                    </td>
-                    <td class="muted">{{ f.page_reference ?? '—' }}</td>
-                  </tr>
-                </tbody>
-              </table>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="doc-preview-placeholder">
+                      <span class="muted" style="font-size: 12px;">—</span>
+                    </div>
+                  </template>
+                </div>
+              </div>
+
+              <!-- Extracted fields -->
+              <div class="doc-fields-col">
+                <div class="doc-preview-label">Extracted Fields</div>
+                <div v-if="d.extracted_fields.length === 0" class="empty-mini" style="margin-top: 8px;">
+                  No fields extracted.
+                </div>
+                <table v-else class="table mini" style="margin-top: 0;">
+                  <thead>
+                    <tr>
+                      <th style="width: 38%;">Field</th>
+                      <th>Value</th>
+                      <th style="width: 120px;">Confidence</th>
+                      <th style="width: 52px;">Page</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr v-for="f in d.extracted_fields" :key="f.label">
+                      <td>{{ f.label }}</td>
+                      <td class="mono">{{ f.value ?? '—' }}</td>
+                      <td>
+                        <span v-if="f.confidence != null" class="confbar">
+                          <span class="confbar-track">
+                            <span class="confbar-fill" :class="confKlass(f.confidence)"
+                              :style="{ width: (f.confidence * 100).toFixed(0) + '%' }"></span>
+                          </span>
+                          <span class="muted" style="font-size: 12px;">
+                            {{ (f.confidence * 100).toFixed(0) }}%
+                          </span>
+                        </span>
+                        <span v-else class="muted">—</span>
+                      </td>
+                      <td class="muted">{{ f.page_reference ?? '—' }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
-            <div v-else class="empty-mini">No extracted fields recorded for this document.</div>
           </article>
         </section>
 
@@ -471,23 +524,72 @@ function detailString(d: any): string {
 }
 
 /* documents */
-.doc { padding: 18px 20px; border-bottom: 1px solid var(--border); }
-.doc:last-child { border-bottom: none; }
-.doc-head {
-  display: flex; justify-content: space-between; align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 12px;
+.doc-card { padding: 0; overflow: hidden; }
+.doc-card-header {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 12px; padding: 12px 16px;
+  background: var(--bg-soft); border-bottom: 1px solid var(--border);
 }
 .doc-name { font-weight: 600; font-size: 14px; }
-.doc-status { display: flex; gap: 12px; align-items: center; }
 
-.doc-fields-head {
+.doc-split {
+  display: flex;
+  gap: 0;
+  min-height: 220px;
+}
+.doc-preview-col {
+  width: 46%;
+  min-width: 200px;
+  padding: 14px;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.doc-fields-col {
+  flex: 1;
+  padding: 14px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.doc-preview-label {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: .06em;
   color: var(--text-3);
-  margin-bottom: 6px;
+  margin-bottom: 2px;
+  padding: 0 0 0 2px;
 }
+.doc-fields-col .doc-preview-label { padding: 0 14px; margin-bottom: 8px; }
+.doc-preview-frame {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  min-height: 160px;
+}
+.doc-preview-img {
+  max-width: 100%;
+  max-height: 360px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  object-fit: contain;
+  display: block;
+}
+.doc-preview-pdf {
+  width: 100%; height: 320px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+.doc-preview-placeholder {
+  width: 100%; min-height: 120px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg); border-radius: var(--r-md);
+  border: 1px dashed var(--border);
+}
+
 .table.mini th, .table.mini td { padding: 8px 12px; font-size: 12.5px; }
 .table.mini { background: var(--bg-soft); border-radius: var(--r-md); overflow: hidden; }
 
@@ -523,8 +625,9 @@ function detailString(d: any): string {
   .hero-top { flex-direction: column; }
   .hero-rec { align-items: flex-start; max-width: 100%; }
   .hero-rationale { text-align: left; }
-  .doc-head { flex-direction: column; }
-  .doc-status { align-items: flex-start; }
+  .doc-card-header { flex-direction: column; align-items: flex-start; }
+  .doc-split { flex-direction: column; }
+  .doc-preview-col { width: 100%; border-right: none; border-bottom: 1px solid var(--border); }
   .kv { grid-template-columns: 1fr; }
   .val-item-cmp { grid-template-columns: 1fr; }
 }
