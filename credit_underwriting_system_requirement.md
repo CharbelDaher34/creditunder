@@ -566,33 +566,6 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 
 ---
 
-#### 8.1 Recommended Indexes
-
-The following indexes are required for the query patterns in the processing pipeline and the Workbench API. Queries on large tables without these indexes will degrade non-linearly as case volume grows.
-
-| Table | Index | Justification |
-|---|---|---|
-| `inbound_application_event` | UNIQUE on `event_id` | Primary deduplication gate at event consumption. |
-| `application_case` | UNIQUE on `application_id` | Business key lookup; resubmission conflict detection. |
-| `application_case` | Index on `validator_id` | Workbench: load all cases for a Validator at login. |
-| `application_case` | Index on `supervisor_id` | Workbench: load all cases for a Supervisor's team. |
-| `application_case` | Index on `(status, created_at DESC)` | Workbench: dashboard filter by status, sorted by submission date. |
-| `case_document` | Index on `case_id` | Pipeline: load all documents for a case in one query. |
-| `stage_output_version` | Index on `(case_document_id, version DESC)` | Pipeline: fetch the latest extraction version per document. |
-| `validation_result` | Index on `(case_id, outcome)` | Workbench: validation panel grouped by outcome. |
-| `audit_event` | Index on `(case_id, occurred_at ASC)` | Workbench: chronological audit timeline per case. |
-| `processing_job` | Index on `(case_id, job_type, status)` | Pipeline: check job state before retrying. |
-| `dead_letter_event` | Index on `source_event_id` | Ops: trace from an inbound event to its dead-letter entry. |
-
-#### 8.2 Partitioning
-
-`audit_event` grows without bound — one or more rows per stage per case. At 300 events/hour × 8 working hours × ~15 audit rows per case, this table will accumulate approximately **36,000 rows per working day**. The table is **monthly RANGE-partitioned on `occurred_at`** (PostgreSQL native partitioning). Implementation details:
-
-- The primary key is composite (`id`, `occurred_at`) so the partition key can participate in the PK as required by PostgreSQL.
-- The migration creates partitions covering 2026-01 through ~18 months past the migration date and a `audit_event_default` catch-all so a missing future partition never silently drops audit rows.
-- Indexes (`ix_audit_event_case_id`, `ix_audit_event_occurred_at`, `ix_audit_event_case_time`) are declared on the parent table; PostgreSQL propagates them to all current and future partitions.
-- A scheduled maintenance job (e.g. `pg_partman` or a cron task) must extend the partition window before the last explicit partition fills.
-
 #### 8.3 Validation Configuration (`validation_config.yaml`)
 
 Validation **logic** lives in code (handlers); validation **numbers** live in YAML so they can be tuned without a code deployment. The file is bundled with the application and loaded once per process.
