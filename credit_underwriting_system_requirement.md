@@ -647,25 +647,6 @@ This guarantees the BR-30 explainability PDF and the Workbench's checks table ca
 
 ### 9. End-To-End Sequence
 
-#### Component Overview
-
-```mermaid
-flowchart LR
-    CRM[Siebel CRM] -->|Kafka event| KAFKA[Kafka]
-    KAFKA -->|consumes| AP[Application Processor]
-    AP --> PH[Product Handler]
-    PH -->|fetch / upload| DMS[DMS]
-    PH -->|verify / extract| AISVC[AI Service]
-    AP -->|generate report| RG[Report Generator]
-    RG -->|narrative| AISVC
-    RG -->|upload PDF| DMS
-    AP --> PG[(Postgres)]
-    PH --> PG
-    RG --> PG
-    AP -->|final write| EDW[(EDW)]
-    AP -->|traces / logs / metrics| OBS[OTel Backend]
-```
-
 #### Detailed Sequence
 
 ```mermaid
