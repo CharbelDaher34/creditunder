@@ -742,9 +742,9 @@ These targets drive the horizontal scaling model in Section 10.1 and inform the 
 
 #### 10.1 Horizontal Scaling
 
-The Application Processor is the primary scaling unit. Multiple instances run in parallel, each consuming from the same Kafka consumer group — Kafka distributes partitions across instances so that each application is processed by exactly one worker at a time. Adding instances increases throughput linearly with the number of Kafka partitions. The product handlers run in-process with the Application Processor and scale with it automatically. Postgres handles concurrent writes safely via row-level locking and idempotency checks on `application_id`. The database connection pool size must be configured per instance to avoid exhausting Postgres connections as the instance count grows.
+A **single Kafka listener** consumes all incoming events and forwards them to an internal **load balancer**, which distributes work across a pool of Application Processor workers. Each worker handles one case at a time; adding workers increases throughput linearly. Postgres handles concurrent writes safely via row-level locking and idempotency checks on `application_id`. The database connection pool size must be configured per worker to avoid exhausting Postgres connections as the pool grows.
 
-AI Service is the fixed external bottleneck. All AI calls — verification, extraction, and narrative generation — go through a single AI Service deployment. If throughput demand grows, AI Service instances can be placed behind an HTTP load balancer; the Application Processor's AI client URL points to the load balancer, and the change is transparent to application code. The key operational metric to monitor is the AI Service request queue depth and per-call latency — these are the first signals that AI Service capacity must scale.
+AI Service follows the same pattern: all AI calls go through a **single AI Service load balancer** that distributes requests across AI Service instances. The AI client URL points to the load balancer — no application code changes when capacity scales. Monitor AI Service request queue depth and per-call latency as the primary scaling signals.
 
 #### 10.2 Document Handling at Scale
 
@@ -754,17 +754,17 @@ If document volume grows significantly (large files, high concurrency), fetching
 
 #### 10.3 Structured Logging and Observability
 
-All telemetry — logs, traces, and metrics — is emitted using the **OpenTelemetry (OTel)** SDK and exported to an OTel-compatible backend (e.g. Grafana, Jaeger, Elastic, or any OTLP-compliant collector). OTel is the single instrumentation standard across the entire platform; no vendor-specific SDK is used directly in application code. This ensures the observability stack can be swapped without touching application logic.
+All telemetry is emitted via the **OpenTelemetry (OTel)** SDK (logs, traces, metrics) and exported to any OTLP-compatible backend. No vendor-specific SDK is used in application code.
 
-**Logs** are emitted in JSON format over the OTel Logs signal (OTLP). Every log entry carries the following standard attributes: `application_id`, `event_id`, `trace_id` (auto-propagated by the OTel SDK for distributed trace correlation), `span_id`, `component` (e.g. `application_processor`, `product_handler.personal_finance`, `report_generator`), `log_level`, `timestamp`, and `message`. Structured key-value attributes — not embedded strings — are used for all queryable fields so the operations team can filter across all cases by `rule_code`, `document_type`, `recommendation`, or any other field without full-text parsing.
+| Signal | What it captures |
+|---|---|
+| **Logs** | JSON, structured key-value attributes (never embedded strings). Standard fields on every entry: `application_id`, `event_id`, `trace_id`, `span_id`, `component`, `log_level`, `timestamp`, `message`. |
+| **Traces** | Root span per Kafka event, child spans per stage (DMS fetch, AI verify, AI extract, validate, report, EDW write). Gives a full latency breakdown per case. |
+| **Metrics** | Counters and histograms: events consumed, cases created, verification/extraction/validation outcomes, report upload, EDW write, end-to-end duration. |
 
-**Traces** use OTel distributed tracing. A root span is created when an event is consumed from Kafka and propagated through every downstream call: DMS fetch, AI Service verification, AI Service extraction, validation, report generation, and EDW write. Each stage runs as a child span. This gives a complete latency breakdown per case and allows pinpointing exactly which stage is slow or failing.
+**Log level policy:** `DEBUG` — field values and internal transitions; `INFO` — pipeline milestones; `WARN` — degraded but non-blocking (low confidence, soft mismatch, retrying); `ERROR` — stage-blocking failures.
 
-**Metrics** are emitted as OTel metrics (counters and histograms): events consumed, cases created, documents verified per outcome (match/mismatch), extractions per outcome (success/failed), validation outcomes by rule code, report upload success/failure, EDW write success/failure, and end-to-end pipeline duration. These metrics are the primary signal for the scaling decisions described in Section 10.1.
-
-Log levels follow a consistent policy: `DEBUG` for per-field extraction values and internal state transitions (development and troubleshooting only); `INFO` for normal pipeline milestones (case started, document fetched, stage completed, case closed); `WARN` for degraded but non-blocking conditions (low-confidence extraction above threshold, soft mismatches, retries in progress); `ERROR` for failures that block a stage (AI Service error, DMS unavailable, Pydantic schema mismatch, EDW write failure).
-
-Business-significant events (case created, document verified, extraction completed, report uploaded, EDW exported) are additionally written as `audit_event` rows in Postgres. This provides an immutable, queryable audit history that is independent of the observability platform and survives log retention windows.
+**Audit log** — business-significant events are also written to `audit_event` in Postgres: an immutable, queryable trail independent of the observability platform's retention window.
 
 #### 10.4 Non-Error Points of Failure
 
