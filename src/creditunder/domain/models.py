@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Generic, Literal, TypeVar
 from uuid import UUID
 
@@ -37,20 +37,11 @@ class EmployerSnapshot(BaseModel):
     Carried inside `applicant_data["employer_snapshot"]`. CRM resolves the
     employer record against the governed employer-rules source and embeds
     the snapshot here so the handler never needs to fetch it.
-
-    `rule_version` and `rule_source_date` identify exactly which rules
-    version produced this snapshot — both are stamped onto every
-    `validation_result` row that consumed employer data, so the audit
-    trail is reproducible across rule updates.
     """
 
     employer_id: str
     employer_name_normalized: str
     employer_class: EmployerClass
-    active_restrictions: list[str] = []
-    max_limit_note: str | None = None
-    rule_version: str
-    rule_source_date: date
 
     @classmethod
     def from_applicant_data(cls, applicant_data: dict | None) -> "EmployerSnapshot | None":
@@ -97,10 +88,7 @@ class ValidationResult:
     expected_value: Any | None = None
     confidence: float | None = None
     manual_review_required: bool = False
-    # Version stamps — every rule outcome is reproducible across config /
-    # employer-rules updates by storing which version was applied.
-    rule_version: str | None = None              # set by handlers when the rule logic itself is versioned
-    employer_rule_version: str | None = None     # set when the rule consumed employer-snapshot data
+    rule_version: str | None = None
     config_version: str | None = None            # set automatically from validation_config.yaml
 
 

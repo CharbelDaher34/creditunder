@@ -83,8 +83,8 @@ src/creditunder/
 │   │                       #   CaseStatus, DocumentStatus, CaseReportStatus,
 │   │                       #   InboundEventStatus, JobType, JobStatus
 │   └── models.py           # ExtractedField[T], DocumentResult, CaseResult, ApplicationEvent,
-│                           #   EmployerSnapshot (employer_class
-│                           #   A/B/C/D/GOV + rule_version), RequiredDocumentSet
+│                           #   EmployerSnapshot (employer_id, employer_name_normalized,
+│                           #   employer_class A/B/C/D/GOV), RequiredDocumentSet
 ├── documents/
 │   ├── __init__.py         # EXTRACTION_SCHEMA_REGISTRY (DocumentType → schema class)
 │   ├── base.py             # BaseExtractionSchema
@@ -93,8 +93,7 @@ src/creditunder/
 ├── handlers/
 │   ├── base.py             # BaseProductHandler (ABC). required_documents(applicant_data) returns
 │   │                       #   RequiredDocumentSet so the set can branch on employer_class.
-│   │                       #   _stamp_versions() writes config_version + employer_rule_version
-│   │                       #   onto every ValidationResult.
+│   │                       #   _stamp_versions() writes config_version onto every ValidationResult.
 │   ├── registry.py         # get_handler(ProductType) → handler instance
 │   └── personal_finance.py # PersonalFinanceHandler — rules: ID_NUMBER_MISMATCH, ID_NAME_CHECK,
 │                           #   ID_EXPIRED, SALARY_EMPLOYER_MATCH, SALARY_DEVIATION (tolerance from
@@ -213,7 +212,7 @@ Siebel CRM → Kafka → ApplicationProcessor
 
 - **Idempotent on `event_id`** — duplicate Kafka messages dropped at `InboundApplicationEvent` unique constraint.
 - **Idempotent on `application_id`** — `ApplicationCase` unique constraint; re-consumed events find the existing case.
-- **`applicant_data.employer_snapshot` is the employer-rules source** — CRM resolves the governed rules source and embeds the snapshot (class, restrictions, max-limit, `rule_version`, `rule_source_date`) at publish time. Handlers read from there; this system never fetches employer data directly. `rule_version` is stamped onto every `validation_result` row that consumed employer data so the BR-30 PDF can show *which* rules version produced any outcome.
+- **`applicant_data.employer_snapshot` is the employer-rules source** — CRM resolves the governed rules source and embeds the snapshot (`employer_id`, `employer_name_normalized`, `employer_class`) at publish time. Handlers read from there; this system never fetches employer data directly.
 - **Versioned thresholds in `validation_config.yaml`** — confidence cutoffs, salary-deviation tolerance, and the outcome→recommendation mapping live in YAML; logic stays in code. Every `validation_result` row carries `config_version` from the YAML so changes are audit-traceable. Restart the processor to pick up edits.
 - **Append-only audit** — `StageOutputVersion` and `ValidationResultRow` are never updated, only inserted.
 - **Delivery is independent of business processing** — `ApplicationCase.status` becomes `COMPLETED` after `handler.validate()` succeeds. Report upload failure is tracked on `case_report.error_detail`; `completed_at` is only set after the PDF is successfully delivered to DMS.
@@ -231,7 +230,7 @@ Siebel CRM → Kafka → ApplicationProcessor
 ### Adding a new product type
 
 1. Add value to `ProductType` in [domain/enums.py](src/creditunder/domain/enums.py)
-2. Create `handlers/your_product.py` extending `BaseProductHandler`. Implement `required_documents(applicant_data) -> RequiredDocumentSet` (branch on `applicant_data["employer_snapshot"]["employer_class"]` if relevant) and `validate(...)`. Wrap every `ValidationResult` with `self._stamp_versions(...)` so `config_version` (and `employer_rule_version` when the rule consumed employer data) is recorded.
+2. Create `handlers/your_product.py` extending `BaseProductHandler`. Implement `required_documents(applicant_data) -> RequiredDocumentSet` (branch on `applicant_data["employer_snapshot"]["employer_class"]` if relevant) and `validate(...)`. Wrap every `ValidationResult` with `self._stamp_versions(...)` so `config_version` is recorded.
 3. Register in [handlers/registry.py](src/creditunder/handlers/registry.py)
 
 ### Adding a new document type
@@ -281,7 +280,7 @@ Host-side ports are overridable: `DMS_PORT`, `CRM_PORT`, `WORKBENCH_API_PORT`, `
 
 ## Sample Data
 
-[mockups/crm/sample_data.py](mockups/crm/sample_data.py) contains two Personal Finance events. Both carry an `applicant_data.employer_snapshot` block (Class A, Saudi Aramco, rule_version `2026.04`):
+[mockups/crm/sample_data.py](mockups/crm/sample_data.py) contains two Personal Finance events. Both carry an `applicant_data.employer_snapshot` block (Class A, Saudi Aramco):
 - `APP-2026-089341` — happy path; declared salary matches certificate → `APPROVE`
 - `APP-2026-089342` — salary mismatch; declared 25,000 vs certificate 18,500 (deviation > the tolerance in `validation_config.yaml`) → `SALARY_DEVIATION` SOFT_MISMATCH → `HOLD`
 

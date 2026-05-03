@@ -15,7 +15,7 @@ Alinma Bank processes credit applications by assigning each case to a human Vali
 5. Generates a structured, human-readable PDF report summarising the case, all validations, and a system recommendation (APPROVE / HOLD / DECLINE).
 6. Delivers the PDF back into DMS and the structured data into the Enterprise Data Warehouse (EDW), so the Validator receives a complete, ready-to-act case package.
 
-The Validator's role shifts from manual data gathering to reviewing a pre-assembled report and acting on the recommendation. Processing time drops from hours to minutes. Every extraction, every validation result, and every system decision is stored immutably for compliance and audit.
+The Validator's role shifts from manual data gathering to reviewing a pre-assembled report and acting on the recommendation. Processing time drops significantly. Every extraction, every validation result, and every system decision is stored immutably for compliance and audit.
 
 ---
 
@@ -47,9 +47,9 @@ The platform is built on four fixed pillars:
 
 ---
 
-### 2. Stakeholders
+### 2. System Participants
 
-| Stakeholder | Role |
+| Participant | Role |
 |---|---|
 | **Siebel CRM** | Two interactions with this system: **(1) Event publisher** — triggers processing by publishing to Kafka with `applicant_data` and document identifiers. **(2) Output consumer** — reads the final PDF report from DMS and the structured case data from EDW once the pipeline completes. Siebel never calls this system's API and is never called by this system during processing. |
 | **Kafka** | Event bus that buffers application-processing events and decouples Siebel CRM from pipeline latency. Events are durable and replayable. |
@@ -73,11 +73,10 @@ The platform is built on four fixed pillars:
 | **AI Service as the unified service** | A single AI Service endpoint handles document verification, extraction, and narrative generation. This avoids managing multiple AI infrastructure components and standardises prompt engineering, model versioning, and monitoring under one service. |
 | **Document type verification before extraction** | Before extracting data, AI Service confirms the document visually matches its declared type (e.g. the file labelled SALARY_CERTIFICATE is actually a salary certificate). This catches mismatched or corrupted uploads early — before they produce misleading extraction results. |
 | **Product handler strategy pattern** | `ProductType` resolves to one handler class that owns all business rules for that product. The Application Processor only coordinates; adding a new product requires only a new class with no changes to the Application Processor or any other component. |
-| **Async, idempotent, retryable stages** | All stages run asynchronously. Every stage boundary is idempotent on `application_id` + `event_id` + stage identity + version number. Retry attempts are persisted; terminal failures go to `dead_letter_event` with full payload for deterministic replay. |
 | **Immutable versioned outputs** | Extraction and validation results are append-only versioned rows — never overwritten. This guarantees a complete, reproducible audit trail for compliance and diagnostics, and allows re-runs to be compared against prior runs. |
 | **HTML-first report generation** | The report is assembled in HTML before being converted to PDF. HTML gives the Report Generator full control over layout: tables, conditional sections, colour coding, and structured visual hierarchy. Storing the HTML in Postgres allows report regeneration without re-running the full pipeline. |
 | **Postgres + EDW dual-database strategy** | Postgres holds all runtime state and retries. EDW receives the settled final output in a **single write per case**, preceded by a staging write in Postgres. The staging row ensures no data loss if the EDW write is interrupted — the write retries from the staging row without re-running the pipeline. |
-| **Dual handoff to Siebel via DMS and EDW** | Siebel CRM consumes two outputs: the PDF from DMS and the structured data from EDW. Handoff is only complete when both `pdf_dms_document_id` is non-null and `edw_staging.status` is `EXPORTED`. |
+| **Dual handoff to Siebel via DMS and EDW** | Siebel CRM consumes two outputs: the PDF from DMS and the structured data from EDW. Handoff is only complete when both `pdf_dms_document_id` is non-null and `edw_staging.export_status` is `EXPORTED`. |
 | **Self-contained processing event** | The Kafka event carries `applicant_data` alongside the document identifiers. Processing is fully self-contained once the event is consumed. A CRM outage cannot block in-flight applications. The trade-off is a larger event payload — CRM must include all fields needed for cross-checking at publish time. |
 
 ---
@@ -92,9 +91,6 @@ Every decision above relies on assumptions that are not derivable from the code 
 | AI Service supports structured output: given a system prompt and a Pydantic model schema, it returns a JSON response that can be validated against that schema. | Extraction uses typed Pydantic models. If AI Service cannot guarantee structured output, a parsing and fallback layer would be required. |
 | DMS exposes document metadata including the `DocumentType` label set by the uploader. | The Product Handler uses this label as the `expectedDocumentType` in the AI verification call. If DMS does not expose this, the handler cannot determine which verification and extraction prompt to apply without an additional classification step. |
 | DMS document identifiers are stable: a `documentId` that exists today will still exist and return the same document when retried minutes later. | Retry logic re-fetches documents by `documentId`. If DMS IDs are ephemeral or mutable, retries could fetch wrong documents. |
-| EDW writes are idempotent: submitting the same `edw_staging` payload twice does not create duplicate records. | The EDW write is retried on failure from the staging row. If EDW is not idempotent, a duplicate-detection mechanism must be added at the EDW layer. |
-| Kafka delivers messages at-least-once. Exactly-once delivery is not guaranteed. | The system deduplicates on `event_id` at consumption time. An event arriving twice is detected and the second occurrence is dropped before any processing begins. |
-| The processing pipeline completes within 30 seconds for 95% of cases at a peak load of 300 events per hour during working hours. | End-to-end SLA and per-stage timing budgets are defined in Section 10.0. Timeout logic must be added per stage and surfaced in observability if the SLA target is not met. |
 | `applicant_data` carried in the Kafka event is the authoritative version of the applicant's record at submission time. | The system never calls Siebel CRM after consuming the event. If CRM records change after submission, this system processes the snapshot at submission time — not the updated version. |
 | The number of product types and document types is small and changes infrequently. | These are modelled in code, not in config tables. If the business requires non-developer-configurable product or document definitions, this design must be revised to support a database-driven configuration layer. |
 | The internal UI (Section 12) is a read-only portal. No case actions (approve, reject, override) are taken through the UI — those happen in Siebel CRM. | The UI backend exposes read-only API endpoints. No write operations are needed on the UI path. |
@@ -126,17 +122,13 @@ The Kafka message that starts processing must carry:
 
 #### 5.1 `applicant_data.employer_snapshot` sub-schema
 
-The Personal Finance handler (and any future product handler that varies its required-document set or rules by employer) reads the employer context from this sub-object. CRM resolves the employer record against the governed employer-rules source (BR-11 / BR-16) and embeds the snapshot at publish time so the processor never fetches employer data itself. The `rule_version` and `rule_source_date` fields are stamped onto every `validation_result` row that consumed employer data, so the audit trail is reproducible across rule updates (BR-15 / BR-30).
+The Personal Finance handler (and any future product handler that varies its required-document set or rules by employer) reads the employer context from this sub-object. CRM resolves the employer record against the governed employer-rules source (BR-11 / BR-16) and embeds the snapshot at publish time so the processor never fetches employer data itself.
 
 | Field | Type | Description |
 |---|---|---|
 | `employer_id` | string | Canonical employer identifier from the rules source. |
 | `employer_name_normalized` | string | Canonical normalised name — used as the comparison anchor for the employer-name validation (BR-07). |
 | `employer_class` | enum (`A`, `B`, `C`, `D`, `GOV`) | Employer class assigned by the governed rules source. Drives the required-document matrix (BR-13 / BR-14). |
-| `active_restrictions` | array of string | Restriction codes currently in force for this employer (e.g. `NEW_HIRES_BLOCKED`). |
-| `max_limit_note` | string \| null | Free-form note on max-limit policy if any. |
-| `rule_version` | string | Identifier of the employer-rules version that produced this snapshot. |
-| `rule_source_date` | date (YYYY-MM-DD) | When the snapshot was produced by CRM. |
 
 **Example event payload:**
 
@@ -160,11 +152,7 @@ The Personal Finance handler (and any future product handler that varies its req
     "employer_snapshot": {
       "employer_id": "EMP-ARAMCO",
       "employer_name_normalized": "SAUDI ARAMCO",
-      "employer_class": "A",
-      "active_restrictions": [],
-      "max_limit_note": null,
-      "rule_version": "2026.04",
-      "rule_source_date": "2026-04-15"
+      "employer_class": "A"
     }
   }
 }
@@ -235,8 +223,7 @@ class BaseProductHandler(ABC):
         documents and never calls AI Service directly — that is the handler's
         responsibility upstream of validate().
 
-        Every ValidationResult is stamped with `config_version` (and, where the
-        rule consumed employer data, `employer_rule_version`) so the audit trail
+        Every ValidationResult is stamped with `config_version` so the audit trail
         is reproducible across config / rules updates.
         """
         raise NotImplementedError
@@ -302,9 +289,11 @@ class Recommendation(str, Enum):
 
 
 class ValidationOutcome(str, Enum):
-    # Every check must map to exactly one of these four categories.
-    # Ops prioritises review: hard breaches first, then soft mismatches,
-    # then low-confidence extractions, then manual-review items.
+    # Every named rule always emits exactly one row; PASS is the outcome when the
+    # rule clears. Ops prioritises review: hard breaches first, then soft mismatches,
+    # then low-confidence extractions, then manual-review items; PASS rows are
+    # collapsed into a separate "Passed rules" section in the report and workbench.
+    PASS = "PASS"                                        # rule cleared — no issue found
     HARD_BREACH = "HARD_BREACH"                         # blocking rule failure
     SOFT_MISMATCH = "SOFT_MISMATCH"                     # non-blocking discrepancy vs. CRM values
     LOW_CONFIDENCE = "LOW_CONFIDENCE"                   # AI confidence below threshold
@@ -374,7 +363,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 
 **`application_case`** — One row per application being processed. Tracks the top-level case state.
 
-> **Resubmission note:** The UNIQUE constraint on `application_id` is intentional. A second event carrying a new `event_id` but the same `application_id` triggers the business/contract failure path in Section 11.2 and never creates a second case row. This constraint must remain until the business formally defines a resubmission policy.
+> **Resubmission note:** The UNIQUE constraint on `application_id` is intentional but is lifted on resubmission. When a new event arrives with the same `application_id`, the prior case row is marked `SUPERSEDED` and a fresh `application_case` row is created — see Section 11.2 for the full resubmission policy.
 
 > **`manual_review_required` vs `MANUAL_INTERVENTION_REQUIRED` status:** These serve distinct purposes. The boolean is set immediately when the handler returns and drives the Workbench priority banner — it means the system made a recommendation but flagged at least one rule for human review. The `MANUAL_INTERVENTION_REQUIRED` status means the pipeline itself could not complete without human action (e.g., missing documents after retry exhaustion). A case can have `manual_review_required = true` and `status = COMPLETED` simultaneously.
 
@@ -440,7 +429,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `id` | UUID PK | |
 | `case_id` | UUID NOT NULL FK → `application_case` | |
 | `rule_code` | string NOT NULL | Identifies the business rule (e.g. `SALARY_EMPLOYER_MATCH`) |
-| `outcome` | string NOT NULL | `HARD_BREACH`, `SOFT_MISMATCH`, `LOW_CONFIDENCE`, `MANUAL_REVIEW_REQUIRED` |
+| `outcome` | string NOT NULL | `PASS`, `HARD_BREACH`, `SOFT_MISMATCH`, `LOW_CONFIDENCE`, `MANUAL_REVIEW_REQUIRED` |
 | `description` | text NOT NULL | Human-readable explanation of the outcome (rendered in the report) |
 | `field_name` | string | Field the rule operated on, when applicable |
 | `extracted_value` | text | Value pulled from the document |
@@ -448,7 +437,6 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `confidence` | float | AI confidence, if applicable |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
 | `rule_version` | string | Identifier of the handler rule logic that produced this row (when the rule itself is versioned). Nullable |
-| `employer_rule_version` | string | Set when the rule consumed `applicant_data.employer_snapshot`. Mirrors `EmployerSnapshot.rule_version` so the row can be traced back to the exact employer-rules version applied (BR-15) |
 | `config_version` | string | Mirrors `validation_config.yaml`'s `version` at evaluation time. Stamped automatically by the handler base class so threshold / mapping changes are reproducible (see Section 8.3) |
 | `evaluated_at` | timestamptz NOT NULL | |
 
@@ -732,7 +720,7 @@ sequenceDiagram
     AP->>ODB: Write complete final payload to edw_staging
     AP->>EDW: Write settled output from edw_staging (single operation)
     EDW-->>AP: Confirm write
-    AP->>ODB: Mark edw_staging.status = EXPORTED
+    AP->>ODB: Mark edw_staging.export_status = EXPORTED
 
     AP->>ODB: Write audit_event (CASE_COMPLETED)
     AP->>OBS: Emit processing-completed metric and trace
@@ -802,7 +790,7 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 - Missing required documents → `application_case.status = MANUAL_INTERVENTION_REQUIRED`, `application_case.error_detail` set, plus `dead_letter_event` row.
 - Per-document failures (DMS fetch, AI verify+extract, unknown document type) → `case_document.status = *_FAILED`, `case_document.error_detail` set; the case continues with whatever documents succeeded so the handler can emit an explicit HARD_BREACH for the missing input rather than the case silently passing.
 - Report generation or upload failure → `case_report.status = FAILED`, `case_report.error_detail` set. `application_case.status` stays `COMPLETED` because business processing is done; `application_case.completed_at` stays NULL until the report is uploaded.
-- EDW export failure → `edw_staging.status = EXPORT_FAILED`, `edw_staging.export_error` set. `application_case.completed_at` stays NULL until the export retry succeeds against the persisted staging payload.
+- EDW export failure → `edw_staging.export_status = EXPORT_FAILED`, `edw_staging.export_error` set. `application_case.completed_at` stays NULL until the export retry succeeds against the persisted staging payload.
 
 `application_case.completed_at` is set **only** when both delivery sides (report uploaded, EDW exported) have succeeded. A NULL `completed_at` on a `COMPLETED` case is the unambiguous signal that something downstream is unresolved — the specific failure is on the relevant child row.
 
@@ -961,7 +949,7 @@ Selecting a card opens the detail view. It shows the full picture of the case in
 - Extraction status
 - Per-field extracted values with their confidence scores (from `stage_output_version.extracted_data`)
 
-**Employer rules panel** — when `applicant_data.employer_snapshot` is present, shows employer name, class, active restrictions, max-limit note, and the rule version + source date that produced the snapshot (BR-15).
+**Employer rules panel** — when `applicant_data.employer_snapshot` is present, shows employer name (normalised), employer class, and the employer ID from the rules source.
 
 **Document completeness panel** — required documents (resolved by the handler from `applicant_data`), received documents, missing documents (BR-12).
 

@@ -8,6 +8,7 @@ from uuid import UUID
 import structlog
 from aiokafka import AIOKafkaConsumer
 from sqlalchemy import func, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -168,6 +169,17 @@ class ApplicationProcessor:
             await session.commit()
             log.info("processor.recovery.done", recovered=len(stuck))
 
+        # Sync edw_staging for any recovered cases that had a pending row.
+        for case in stuck:
+            try:
+                await self._upsert_edw_staging_status(case.id)
+            except SQLAlchemyError as exc:
+                log.warning(
+                    "edw_staging.recovery_update_failed",
+                    application_id=case.application_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
     # ------------------------------------------------------------------ #
     #  Message ingest                                                       #
     # ------------------------------------------------------------------ #
@@ -314,6 +326,18 @@ class ApplicationProcessor:
             )
             await session.commit()
 
+        # Write a pending row to edw_staging immediately so the workbench
+        # board shows the case as IN_PROGRESS rather than invisible. The full
+        # denormalised payload is written (upserted) at completion.
+        try:
+            await self._upsert_edw_staging_pending(event, case_id)
+        except SQLAlchemyError as exc:
+            log.warning(
+                "edw_staging.pending_write_failed",
+                application_id=event.application_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
         # Fetch + verify + extract every document concurrently.
         results = await asyncio.gather(*[
             self._process_document(event, case_id, doc_id) for doc_id in event.document_ids
@@ -436,6 +460,14 @@ class ApplicationProcessor:
             error=f"Required document types not found: {missing_names}",
             raw_payload=event.model_dump(mode="json"),
         )
+        try:
+            await self._upsert_edw_staging_status(case_id)
+        except SQLAlchemyError as exc:
+            log.warning(
+                "edw_staging.status_update_failed",
+                application_id=event.application_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     async def _persist_validation(
         self,
@@ -469,7 +501,6 @@ class ApplicationProcessor:
                     confidence=vr.confidence,
                     manual_review_required=is_manual,
                     rule_version=vr.rule_version,
-                    employer_rule_version=vr.employer_rule_version,
                     config_version=vr.config_version,
                 ))
 
@@ -737,6 +768,25 @@ class ApplicationProcessor:
             report_id = report_row.id
             await session.commit()
 
+        # Fetch audit timeline so the report can include it.
+        async with AsyncSessionLocal() as session:
+            audit_rows = (
+                await session.execute(
+                    select(AuditEvent)
+                    .where(AuditEvent.case_id == case_id)
+                    .order_by(AuditEvent.occurred_at.asc())
+                )
+            ).scalars().all()
+        audit_timeline = [
+            {
+                "event_type": a.event_type,
+                "actor": a.actor,
+                "detail": a.detail,
+                "occurred_at": a.occurred_at.strftime("%Y-%m-%d %H:%M:%S UTC") if a.occurred_at else "—",
+            }
+            for a in audit_rows
+        ]
+
         try:
             html, pdf_bytes, narrative = await self._run_with_job(
                 case_id=case_id,
@@ -747,6 +797,7 @@ class ApplicationProcessor:
                     branch_name=event.branch_name,
                     validator_id=event.validator_id,
                     required_documents=required_set,
+                    audit_timeline=audit_timeline,
                 ),
                 timeout=_TIMEOUT_AI_NARRATIVE + 10.0,  # narrative + rendering budget
             )
@@ -846,6 +897,136 @@ class ApplicationProcessor:
     #  EDW staging                                                          #
     # ------------------------------------------------------------------ #
 
+    async def _upsert_edw_staging_pending(
+        self, event: ApplicationEvent, case_id: UUID
+    ) -> None:
+        """Insert a minimal IN_PROGRESS row so the case appears on the board immediately.
+
+        Uses ON CONFLICT DO NOTHING — if the row already exists (e.g. resubmission
+        of a previously completed case) we leave the existing full payload intact.
+        """
+        applicant_data = event.applicant_data or {}
+        applicant_name = applicant_data.get("name") if isinstance(applicant_data, dict) else None
+        now = datetime.now(timezone.utc)
+
+        pending_payload = {
+            "case": {
+                "id": str(case_id),
+                "application_id": event.application_id,
+                "applicant_name": applicant_name,
+                "product_type": event.product_type,
+                "branch_name": event.branch_name,
+                "validator_id": event.validator_id,
+                "supervisor_id": event.supervisor_id,
+                "status": CaseStatus.IN_PROGRESS.value,
+                "recommendation": None,
+                "recommendation_rationale": None,
+                "manual_review_required": False,
+                "error_detail": None,
+                "applicant_data": applicant_data,
+                "created_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "completed_at": None,
+            },
+            "employer_snapshot": (
+                applicant_data.get("employer_snapshot")
+                if isinstance(applicant_data, dict) else None
+            ),
+            "documents": [],
+            "validations": {
+                "hard_breach": [], "soft_mismatch": [],
+                "low_confidence": [], "manual_review": [],
+            },
+            "manual_checks": [],
+            "technical_exceptions": [],
+            "report": {
+                "status": None,
+                "pdf_available": False,
+                "pdf_uploaded_at": None,
+                "error_detail": None,
+            },
+            "audit_timeline": [],
+        }
+
+        async with AsyncSessionLocal() as session:
+            stmt = pg_insert(EdwStaging).values(
+                case_id=case_id,
+                application_id=event.application_id,
+                validator_id=event.validator_id,
+                supervisor_id=event.supervisor_id,
+                product_type=event.product_type,
+                branch_name=event.branch_name,
+                applicant_name=applicant_name,
+                status=CaseStatus.IN_PROGRESS.value,
+                recommendation=None,
+                manual_review_required=False,
+                pdf_dms_document_id=None,
+                error_detail=None,
+                created_at=now,
+                updated_at=now,
+                completed_at=None,
+                payload=pending_payload,
+                export_status="PENDING",
+                staged_at=now,
+            ).on_conflict_do_nothing(constraint="uq_edw_staging_case_id")
+            await session.execute(stmt)
+            await session.commit()
+        log.info("edw_staging.pending_written", application_id=event.application_id)
+
+    async def _upsert_edw_staging_status(self, case_id: UUID) -> None:
+        """Update the promoted status columns on an existing edw_staging row.
+
+        Called after FAILED or MANUAL_INTERVENTION_REQUIRED transitions so the
+        board reflects the terminal state even when the full payload write is
+        skipped (terminal failures have no complete pipeline data to snapshot).
+        No-op if no row exists yet (e.g. pending write itself failed).
+        """
+        async with AsyncSessionLocal() as session:
+            case_row = await session.scalar(
+                select(ApplicationCase).where(ApplicationCase.id == case_id)
+            )
+            if case_row is None:
+                return
+
+            now = datetime.now(timezone.utc)
+            existing = await session.scalar(
+                select(EdwStaging).where(EdwStaging.case_id == case_id)
+            )
+            if existing is None:
+                return
+
+            # Patch the status/error columns in both the promoted columns and payload.
+            payload = dict(existing.payload)
+            case_block = dict(payload.get("case", {}))
+            case_block["status"] = case_row.status
+            case_block["error_detail"] = case_row.error_detail
+            case_block["updated_at"] = now.isoformat()
+            payload["case"] = case_block
+
+            # Surface error as a technical exception so the workbench detail
+            # view shows it consistently even before a full snapshot is written.
+            if case_row.error_detail:
+                tex = payload.get("technical_exceptions", [])
+                already = any(
+                    t.get("kind") == "PIPELINE_FAILURE" for t in tex
+                )
+                if not already:
+                    tex = [{"kind": "PIPELINE_FAILURE",
+                            "description": case_row.error_detail,
+                            "reference": f"case status: {case_row.status}"}] + tex
+                    payload["technical_exceptions"] = tex
+
+            await session.execute(
+                update(EdwStaging).where(EdwStaging.case_id == case_id).values(
+                    status=case_row.status,
+                    error_detail=case_row.error_detail,
+                    updated_at=now,
+                    payload=payload,
+                )
+            )
+            await session.commit()
+        log.info("edw_staging.status_updated", case_id=str(case_id), status=case_row.status)
+
     async def _write_edw_staging(
         self,
         application_id: str,
@@ -925,7 +1106,7 @@ class ApplicationProcessor:
 
             # --- validations (pre-grouped) --------------------------------
             valids: dict[str, list] = {
-                "hard_breach": [], "soft_mismatch": [],
+                "passed": [], "hard_breach": [], "soft_mismatch": [],
                 "low_confidence": [], "manual_review": [],
             }
             for v in val_rows:
@@ -940,11 +1121,12 @@ class ApplicationProcessor:
                     "confidence": v.confidence,
                     "manual_review_required": v.manual_review_required,
                     "rule_version": v.rule_version,
-                    "employer_rule_version": v.employer_rule_version,
                     "config_version": v.config_version,
                     "evaluated_at": v.evaluated_at.isoformat() if v.evaluated_at else None,
                 }
                 match v.outcome:
+                    case "PASS":
+                        valids["passed"].append(entry)
                     case "HARD_BREACH":
                         valids["hard_breach"].append(entry)
                     case "SOFT_MISMATCH":
@@ -1059,33 +1241,47 @@ class ApplicationProcessor:
             }
 
             pdf_dms_doc_id = report_row.pdf_dms_document_id if report_row else None
+            now = datetime.now(timezone.utc)
 
-            try:
-                session.add(EdwStaging(
-                    case_id=case_id,
-                    application_id=case_row.application_id,
-                    validator_id=case_row.validator_id,
-                    supervisor_id=case_row.supervisor_id,
-                    product_type=case_row.product_type,
-                    branch_name=case_row.branch_name,
-                    applicant_name=applicant_name_val,
-                    status=case_row.status,
-                    recommendation=case_row.recommendation,
-                    manual_review_required=case_row.manual_review_required,
-                    pdf_dms_document_id=pdf_dms_doc_id,
-                    error_detail=case_row.error_detail,
-                    created_at=case_row.created_at,
-                    updated_at=completed_at,
-                    completed_at=completed_at,
-                    payload=payload,
-                    export_status="STAGED",
-                    staged_at=datetime.now(timezone.utc),
-                ))
-                await session.commit()
-            except IntegrityError:
-                await session.rollback()
-                log.warning("edw_staging.already_exists", application_id=application_id)
-                return
+            # Upsert: the pending row written at IN_PROGRESS is updated in-place
+            # with the full denormalised snapshot. ON CONFLICT updates every column
+            # so the workbench immediately sees the completed state.
+            stmt = pg_insert(EdwStaging).values(
+                case_id=case_id,
+                application_id=case_row.application_id,
+                validator_id=case_row.validator_id,
+                supervisor_id=case_row.supervisor_id,
+                product_type=case_row.product_type,
+                branch_name=case_row.branch_name,
+                applicant_name=applicant_name_val,
+                status=case_row.status,
+                recommendation=case_row.recommendation,
+                manual_review_required=case_row.manual_review_required,
+                pdf_dms_document_id=pdf_dms_doc_id,
+                error_detail=case_row.error_detail,
+                created_at=case_row.created_at,
+                updated_at=completed_at,
+                completed_at=completed_at,
+                payload=payload,
+                export_status="STAGED",
+                staged_at=now,
+            ).on_conflict_do_update(
+                constraint="uq_edw_staging_case_id",
+                set_={
+                    "status": case_row.status,
+                    "recommendation": case_row.recommendation,
+                    "manual_review_required": case_row.manual_review_required,
+                    "pdf_dms_document_id": pdf_dms_doc_id,
+                    "error_detail": case_row.error_detail,
+                    "updated_at": completed_at,
+                    "completed_at": completed_at,
+                    "payload": payload,
+                    "export_status": "STAGED",
+                    "staged_at": now,
+                },
+            )
+            await session.execute(stmt)
+            await session.commit()
 
         log.info("edw_staging.written", application_id=application_id)
 
@@ -1107,6 +1303,15 @@ class ApplicationProcessor:
                 {"error": error}, actor=_ACTOR,
             )
             await session.commit()
+
+        try:
+            await self._upsert_edw_staging_status(case_id)
+        except SQLAlchemyError as exc:
+            log.warning(
+                "edw_staging.status_update_failed",
+                application_id=application_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
 
     # ------------------------------------------------------------------ #
     #  Retry wrapper with processing_job tracking                           #

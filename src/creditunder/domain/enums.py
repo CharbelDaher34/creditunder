@@ -14,6 +14,7 @@ class DocumentType(str, Enum):
 
 
 class ValidationOutcome(str, Enum):
+    PASS = "PASS"
     HARD_BREACH = "HARD_BREACH"
     SOFT_MISMATCH = "SOFT_MISMATCH"
     LOW_CONFIDENCE = "LOW_CONFIDENCE"

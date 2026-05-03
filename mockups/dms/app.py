@@ -75,7 +75,8 @@ _ID_DOCUMENT_ROWS = [
 
 _SALARY_CERT_ROWS = [
     ("Document Type",     "Salary Certificate"),
-    ("Issuer",            "Saudi Aramco — Human Resources"),
+    ("Employer",          "Saudi Aramco"),
+    ("Issuing Department","Human Resources"),
     ("Date",              "2026-04-15"),
     ("Employee Name",     "Mohammed Al-Harbi"),
     ("Employee ID",       "ARW-49821"),
@@ -148,7 +149,16 @@ def _render_document_image(title: str, rows: list[tuple[str, str]]) -> bytes:
     return buf.getvalue()
 
 
+_SEED_VERSION = "v2"
+_SEED_VERSION_FILE = DATA_DIR / ".seed_version"
+
+
 def _seed() -> None:
+    # Regenerate seeded documents when the seed version changes so that
+    # fixes to the sample data take effect without manual volume cleanup.
+    current = _SEED_VERSION_FILE.read_text().strip() if _SEED_VERSION_FILE.exists() else ""
+    force = current != _SEED_VERSION
+
     for doc_id, name, doc_type, title, rows in [
         (
             "DMS-00192",
@@ -165,8 +175,10 @@ def _seed() -> None:
             _SALARY_CERT_ROWS,
         ),
     ]:
-        if not _meta_path(doc_id).exists():
+        if force or not _meta_path(doc_id).exists():
             _save(doc_id, name, doc_type, _render_document_image(title, rows), "image/png")
+
+    _SEED_VERSION_FILE.write_text(_SEED_VERSION)
 
 
 _seed()

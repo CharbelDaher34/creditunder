@@ -23,6 +23,7 @@ interface ValidationItem {
   manual_review_required: boolean; evaluated_at: string;
 }
 interface Validations {
+  passed: ValidationItem[]
   hard_breach: ValidationItem[]
   soft_mismatch: ValidationItem[]
   low_confidence: ValidationItem[]
@@ -71,7 +72,7 @@ watch(activeTab, (tab) => {
 const validationCount = computed(() => {
   if (!data.value) return 0
   const v = data.value.validations
-  return v.hard_breach.length + v.soft_mismatch.length + v.low_confidence.length + v.manual_review.length
+  return v.passed.length + v.hard_breach.length + v.soft_mismatch.length + v.low_confidence.length + v.manual_review.length
 })
 
 onMounted(async () => {
@@ -116,6 +117,7 @@ function reportChip(s: string | null) {
   return 'chip-info'
 }
 function outcomeChip(o: string) {
+  if (o === 'PASS') return 'chip-success'
   if (o === 'HARD_BREACH') return 'chip-danger'
   if (o === 'SOFT_MISMATCH') return 'chip-warning'
   if (o === 'LOW_CONFIDENCE') return 'chip-info'
@@ -453,6 +455,32 @@ function detailString(d: any): string {
                 </div>
               </div>
             </div>
+
+            <!-- Passed rules — collapsed by default, same count always present -->
+            <details v-if="data.validations.passed.length > 0" class="val-passed-details">
+              <summary class="val-group-title val-passed-summary">
+                <span>Passed rules</span>
+                <span class="chip chip-success">{{ data.validations.passed.length }}</span>
+              </summary>
+              <div v-for="v in data.validations.passed" :key="v.id" class="val-item val-item-pass">
+                <div class="val-item-head">
+                  <span class="chip chip-success">PASS</span>
+                  <span class="mono">{{ v.rule_code }}</span>
+                  <span v-if="v.field_name" class="muted" style="font-size: 12px;">on {{ v.field_name }}</span>
+                </div>
+                <div class="val-item-desc">{{ v.description }}</div>
+                <div v-if="v.extracted_value || v.expected_value" class="val-item-cmp">
+                  <div>
+                    <span class="muted">Extracted:</span>
+                    <span class="mono">{{ v.extracted_value ?? '—' }}</span>
+                  </div>
+                  <div>
+                    <span class="muted">Expected:</span>
+                    <span class="mono">{{ v.expected_value ?? '—' }}</span>
+                  </div>
+                </div>
+              </div>
+            </details>
           </template>
         </section>
 
@@ -608,6 +636,16 @@ function detailString(d: any): string {
   padding: 12px 14px;
   margin-bottom: 8px;
 }
+.val-item-pass {
+  opacity: 0.7;
+}
+.val-passed-details { margin-top: 4px; }
+.val-passed-details[open] .val-passed-summary { margin-bottom: 10px; }
+.val-passed-summary {
+  list-style: none; cursor: pointer;
+  user-select: none;
+}
+.val-passed-summary::-webkit-details-marker { display: none; }
 .val-item-head { display: flex; gap: 10px; align-items: center; margin-bottom: 6px; }
 .val-item-desc { font-size: 13px; color: var(--text-2); }
 .val-item-cmp {

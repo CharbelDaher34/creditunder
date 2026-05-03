@@ -70,10 +70,6 @@ _ARAMCO_EMPLOYER_SNAPSHOT = {
     "employer_id": "EMP-ARAMCO",
     "employer_name_normalized": "SAUDI ARAMCO",
     "employer_class": "A",
-    "active_restrictions": [],
-    "max_limit_note": None,
-    "rule_version": "2026.04",
-    "rule_source_date": "2026-04-15",
 }
 
 

@@ -53,7 +53,6 @@ class ValidationDetail(BaseModel):
     confidence: float | None
     manual_review_required: bool
     rule_version: str | None
-    employer_rule_version: str | None
     config_version: str | None
     evaluated_at: datetime
 
@@ -61,6 +60,7 @@ class ValidationDetail(BaseModel):
 class ValidationGroups(BaseModel):
     """Validation rows grouped by outcome — order matters for the UI."""
 
+    passed: list[ValidationDetail] = Field(default_factory=list)
     hard_breach: list[ValidationDetail] = Field(default_factory=list)
     soft_mismatch: list[ValidationDetail] = Field(default_factory=list)
     low_confidence: list[ValidationDetail] = Field(default_factory=list)

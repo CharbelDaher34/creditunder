@@ -15,23 +15,16 @@ body {
 }
 
 /* ── Page-break control (WeasyPrint) ───────────────────────────────── */
-/* Repeat column headers when a table spans multiple pages */
 thead { display: table-header-group; }
 tfoot { display: table-footer-group; }
-
-/* Never split a single row across a page boundary */
 tr  { break-inside: avoid; page-break-inside: avoid; }
-
-/* Allow tables to break across pages, but keep section blocks together */
 table { break-inside: auto; page-break-inside: auto; }
-
-/* Keep the following block-level elements intact if they fit on a page */
-.rec-hero, .info-panel, .doc-card, .section-title {
+.rec-hero, .info-panel, .doc-card, .section-title, .val-group-header {
   break-inside: avoid;
   page-break-inside: avoid;
 }
-/* Prevent an orphaned section title at the bottom of a page */
 .section-title { break-after: avoid; page-break-after: avoid; }
+.val-group-header { break-after: avoid; page-break-after: avoid; }
 
 /* ── Page header ───────────────────────────────────────────────────── */
 .page-header {
@@ -143,7 +136,7 @@ table { break-inside: auto; page-break-inside: auto; }
   padding: 12px 16px;
   margin-bottom: 14px;
 }
-.info-panel dl { display: grid; grid-template-columns: 180px 1fr; gap: 5px 12px; }
+.info-panel dl { display: grid; grid-template-columns: 200px 1fr; gap: 5px 12px; }
 .info-panel dt { font-weight: 600; font-size: 9pt; color: #4b5563; }
 .info-panel dd { font-size: 9.5pt; color: #1e2433; }
 
@@ -153,8 +146,6 @@ table {
   border-collapse: collapse;
   margin-bottom: 14px;
   font-size: 9.5pt;
-  /* Fixed layout honours explicit column widths and forces text to wrap
-     within each cell instead of pushing the table wider than the page. */
   table-layout: fixed;
 }
 thead th {
@@ -165,7 +156,6 @@ thead th {
   font-size: 8.5pt;
   font-weight: 600;
   letter-spacing: .04em;
-  /* Wrap long header text rather than stretching the column */
   word-break: break-word;
   overflow-wrap: break-word;
 }
@@ -173,7 +163,6 @@ tbody td {
   padding: 6px 10px;
   border-bottom: 1px solid #e5e7eb;
   vertical-align: top;
-  /* Force cell content to wrap — prevents horizontal overflow */
   word-break: break-word;
   overflow-wrap: break-word;
   hyphens: auto;
@@ -190,13 +179,13 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   font-weight: 700;
   letter-spacing: .02em;
 }
-.APPROVE, .PASSED  { background: #dcfce7; color: #15803d; }
-.HOLD              { background: #fef9c3; color: #a16207; }
-.DECLINE, .FAILED  { background: #fee2e2; color: #b91c1c; }
-.HARD_BREACH       { background: #fee2e2; color: #b91c1c; }
-.SOFT_MISMATCH     { background: #fef9c3; color: #a16207; }
-.LOW_CONFIDENCE    { background: #dbeafe; color: #1e40af; }
-.MANUAL_REVIEW_REQUIRED { background: #f3f4f6; color: #374151; }
+.APPROVE, .PASSED, .PASS { background: #dcfce7; color: #15803d; }
+.HOLD                     { background: #fef9c3; color: #a16207; }
+.DECLINE, .FAILED         { background: #fee2e2; color: #b91c1c; }
+.HARD_BREACH              { background: #fee2e2; color: #b91c1c; }
+.SOFT_MISMATCH            { background: #fef9c3; color: #a16207; }
+.LOW_CONFIDENCE           { background: #dbeafe; color: #1e40af; }
+.MANUAL_REVIEW_REQUIRED   { background: #f3f4f6; color: #374151; }
 
 /* ── Confidence bar ────────────────────────────────────────────────── */
 .conf-wrap { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
@@ -225,10 +214,10 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   background: #f9fafb;
   border-bottom: 1px solid #e5e7eb;
   font-size: 9pt;
+  display: flex;
+  gap: 20px;
+  align-items: center;
 }
-
-/* Two-column body via CSS table — WeasyPrint handles display:table
-   across page breaks more reliably than flexbox. */
 .doc-body {
   display: table;
   width: 100%;
@@ -259,8 +248,6 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   vertical-align: top;
   padding: 0;
 }
-/* Reset the table-inside-table-cell: must NOT inherit table-layout:fixed
-   from the outer table rule — give it auto so columns size to content. */
 .doc-fields table {
   margin: 0;
   table-layout: auto;
@@ -268,6 +255,21 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
 }
 .doc-fields thead th { background: #374151; font-size: 8pt; padding: 5px 8px; }
 .doc-fields tbody td { padding: 5px 8px; font-size: 9pt; }
+
+/* ── Validation groups ─────────────────────────────────────────────── */
+.val-group-header {
+  padding: 5px 10px;
+  font-size: 8.5pt;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.val-group-header.HARD_BREACH            { background: #fee2e2; color: #b91c1c; }
+.val-group-header.SOFT_MISMATCH          { background: #fef9c3; color: #a16207; }
+.val-group-header.LOW_CONFIDENCE         { background: #dbeafe; color: #1e40af; }
+.val-group-header.MANUAL_REVIEW_REQUIRED { background: #f3f4f6; color: #374151; border-top: 1px solid #e5e7eb; }
+.val-group-header.PASS                   { background: #f0fdf4; color: #15803d; border-top: 1px solid #e5e7eb; }
+.val-pass-row td { color: #6b7280; }
 
 /* ── Technical exceptions ──────────────────────────────────────────── */
 .tech-banner {
@@ -290,6 +292,23 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   border: 1px dashed #9ca3af;
 }
 .tech-row td { border-left: 3px solid #9ca3af !important; }
+
+/* ── Audit timeline ────────────────────────────────────────────────── */
+.tl-table tbody td { font-size: 9pt; }
+.tl-time { white-space: nowrap; font-family: monospace; font-size: 8.5pt; color: #6b7280; }
+.tl-event { font-weight: 600; }
+.tl-detail {
+  font-size: 8pt;
+  color: #6b7280;
+  font-family: monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-top: 2px;
+}
+.tl-FAILED    { background: #fff1f1 !important; }
+.tl-COMPLETED { background: #f0fdf4 !important; }
+.tl-UPLOADED  { background: #f0fdf4 !important; }
+.tl-WARNING   { background: #fffbeb !important; }
 
 /* ── Footer ────────────────────────────────────────────────────────── */
 .page-footer {
@@ -333,6 +352,19 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   </div>
 </div>
 
+{# ── Applicant Data ────────────────────────────────────────────────── #}
+<div class="section-title">Applicant Information</div>
+<div class="info-panel">
+  <dl>
+  {% for k, v in applicant_data.items() %}
+  {% if k != "employer_snapshot" %}
+  <dt>{{ k.replace('_', ' ').title() }}</dt>
+  <dd>{{ v if v is not none else '—' }}</dd>
+  {% endif %}
+  {% endfor %}
+  </dl>
+</div>
+
 {# ── Employer Rules ────────────────────────────────────────────────── #}
 {% if employer_snapshot %}
 <div class="section-title">Employer Rules</div>
@@ -342,13 +374,6 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
     <dd>{{ employer_snapshot.employer_name_normalized }} ({{ employer_snapshot.employer_id }})</dd>
     <dt>Class</dt>
     <dd>{{ employer_snapshot.employer_class }}</dd>
-    <dt>Active restrictions</dt>
-    <dd>{% if employer_snapshot.active_restrictions %}{{ employer_snapshot.active_restrictions | join(', ') }}{% else %}—{% endif %}</dd>
-    {% if employer_snapshot.max_limit_note %}
-    <dt>Max-limit note</dt><dd>{{ employer_snapshot.max_limit_note }}</dd>
-    {% endif %}
-    <dt>Rule version</dt>
-    <dd>{{ employer_snapshot.rule_version }} (source dated {{ employer_snapshot.rule_source_date }})</dd>
   </dl>
 </div>
 {% endif %}
@@ -359,22 +384,9 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   <dl>
     <dt>Required</dt><dd>{{ required_documents | join(', ') if required_documents else '—' }}</dd>
     <dt>Received</dt><dd>{{ received_documents | join(', ') if received_documents else '—' }}</dd>
-    <dt>Missing</dt><dd>{% if missing_documents %}{{ missing_documents | join(', ') }}{% else %}none{% endif %}</dd>
+    <dt>Missing</dt><dd>{% if missing_documents %}{{ missing_documents | join(', ') }}{% else %}None{% endif %}</dd>
   </dl>
 </div>
-
-{# ── Applicant Data ────────────────────────────────────────────────── #}
-<div class="section-title">Applicant Data</div>
-<table>
-  <thead><tr><th style="width:35%">Field</th><th>Value</th></tr></thead>
-  <tbody>
-  {% for k, v in applicant_data.items() %}
-  {% if k != "employer_snapshot" %}
-  <tr><td>{{ k.replace('_', ' ').title() }}</td><td>{{ v }}</td></tr>
-  {% endif %}
-  {% endfor %}
-  </tbody>
-</table>
 
 {# ── Documents with Extracted Fields ──────────────────────────────── #}
 <div class="section-title">Documents &amp; Extracted Data</div>
@@ -386,15 +398,14 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
       {{ doc.document_type.value if doc.document_type.value is defined else doc.document_type }}
       &nbsp;—&nbsp; {{ doc.document_name or doc_id }}
     </span>
-    <span class="doc-meta">{{ doc_id }}</span>
+    <div class="doc-meta">{{ doc_id }}</div>
   </div>
 
-  {# Verification status row #}
   <div class="doc-verify-row">
     <span>
       Verification:
       {% if doc.verification_passed %}
-        <span class="badge APPROVE">PASSED</span>
+        <span class="badge PASS">PASSED</span>
       {% else %}
         <span class="badge DECLINE">FAILED</span>
       {% endif %}
@@ -412,7 +423,6 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   </div>
 
   <div class="doc-body">
-    {# Left: document image/preview #}
     <div class="doc-preview">
       {% if doc_id in doc_data_uris %}
         {% set ctype = doc_content_types.get(doc_id, '') %}
@@ -426,7 +436,6 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
       {% endif %}
     </div>
 
-    {# Right: extracted fields #}
     <div class="doc-fields">
       {% if doc.extracted_data %}
       <table>
@@ -461,23 +470,30 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
 {% endfor %}
 
 {# ── Validation Checks ─────────────────────────────────────────────── #}
-{# Extracted/expected values are folded into the Description cell to keep
-   the table to 4 columns and prevent horizontal overflow in the PDF.   #}
+{# Grouped by outcome: issues first, passed rules last.                  #}
 <div class="section-title">Validation Checks</div>
 <table>
   <thead>
     <tr>
       <th style="width:22%">Rule</th>
-      <th style="width:16%">Outcome</th>
+      <th style="width:15%">Outcome</th>
       <th>Finding</th>
       <th style="width:9%">Conf.</th>
     </tr>
   </thead>
   <tbody>
-  {% for r in validation_results %}
+  {% for group_title, group_key, group_rows in validation_groups %}
+  {% if group_rows %}
   <tr>
+    <td colspan="4" class="val-group-header {{ group_key }}">
+      {{ group_title }} ({{ group_rows | length }})
+    </td>
+  </tr>
+  {% for r in group_rows %}
+  {% set outcome_str = r.outcome.value if r.outcome.value is defined else r.outcome %}
+  <tr {% if outcome_str == 'PASS' %}class="val-pass-row"{% endif %}>
     <td style="font-size:8pt; font-family:monospace;">{{ r.rule_code }}</td>
-    <td><span class="badge {{ r.outcome }}">{{ r.outcome.replace('_', ' ') }}</span></td>
+    <td><span class="badge {{ outcome_str }}">{{ outcome_str.replace('_', ' ') }}</span></td>
     <td>
       {{ r.description }}
       {% if r.field_name or r.extracted_value is not none or r.expected_value is not none %}
@@ -495,6 +511,8 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
     <td>{% if r.confidence is not none %}{{ (r.confidence * 100) | int }}%{% else %}—{% endif %}</td>
   </tr>
   {% endfor %}
+  {% endif %}
+  {% endfor %}
   </tbody>
 </table>
 
@@ -502,7 +520,7 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
 {% if manual_check_items or document_results %}
 <div class="section-title">Manual Checks Required</div>
 <table>
-  <thead><tr><th style="width:28%">Check</th><th>Description</th><th style="width:28%">Reference</th></tr></thead>
+  <thead><tr><th style="width:28%">Check</th><th>Description</th><th style="width:30%">Reference</th></tr></thead>
   <tbody>
   {% for m in manual_check_items %}
   <tr>
@@ -514,8 +532,8 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   {% for doc in document_results %}
   <tr>
     <td style="font-size:8pt; font-family:monospace;">STAMP_AND_SIGNATURE_REVIEW</td>
-    <td>Visual confirmation of stamp and signature. The system does not render this verdict.</td>
-    <td>{{ doc.document_type }} — {{ doc.document_name }}</td>
+    <td>Visual confirmation of stamp and signature against the reference record. The system does not render this verdict.</td>
+    <td>{{ doc.document_type.value if doc.document_type.value is defined else doc.document_type }} — {{ doc.document_name or doc.document_id }}</td>
   </tr>
   {% endfor %}
   </tbody>
@@ -535,7 +553,38 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
   <tr class="tech-row">
     <td style="width:20%;"><span class="tech-badge">{{ t.kind }}</span></td>
     <td>{{ t.description }}</td>
-    <td>{{ t.reference or '' }}</td>
+    <td style="width:25%;">{{ t.reference or '' }}</td>
+  </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{# ── Audit Timeline ────────────────────────────────────────────────── #}
+{% if audit_timeline %}
+<div class="section-title">Processing Timeline</div>
+<table class="tl-table">
+  <thead>
+    <tr>
+      <th style="width:22%">Time (UTC)</th>
+      <th style="width:28%">Event</th>
+      <th style="width:14%">Actor</th>
+      <th>Detail</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for a in audit_timeline %}
+  {% set et = a.event_type %}
+  <tr class="{% if 'FAILED' in et %}tl-FAILED{% elif et == 'CASE_COMPLETED' or et == 'REPORT_UPLOADED' %}tl-COMPLETED{% elif et == 'MISSING_REQUIRED_DOCUMENTS' %}tl-WARNING{% endif %}">
+    <td class="tl-time">{{ a.occurred_at }}</td>
+    <td class="tl-event">{{ et.replace('_', ' ').title() }}</td>
+    <td style="font-size:8.5pt; color:#6b7280;">{{ a.actor or '—' }}</td>
+    <td>
+      {% if a.detail %}
+      <div class="tl-detail">{% for k, v in a.detail.items() %}{{ k }}: {{ v }}
+{% endfor %}</div>
+      {% else %}—{% endif %}
+    </td>
   </tr>
   {% endfor %}
   </tbody>
@@ -544,7 +593,8 @@ tbody tr:nth-child(even) td { background: #f9fafb; }
 
 {# ── Footer ────────────────────────────────────────────────────────── #}
 <div class="page-footer">
-  <span>Config v{{ config_version or '—' }}{% if employer_snapshot %} · Employer rules v{{ employer_snapshot.rule_version }}{% endif %}</span>
+  <span>{{ application_id }} &nbsp;·&nbsp; Config v{{ config_version or '—' }}{% if employer_snapshot %} &nbsp;·&nbsp; Employer rules v{{ employer_snapshot.rule_version }}{% endif %}</span>
+  <span>{{ generated_at }}</span>
 </div>
 
 </body>

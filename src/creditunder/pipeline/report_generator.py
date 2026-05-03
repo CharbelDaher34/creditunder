@@ -1,4 +1,5 @@
 import base64
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,10 +34,17 @@ class ReportGenerator:
         branch_name: str,
         validator_id: str,
         required_documents: RequiredDocumentSet | None = None,
+        audit_timeline: list[dict] | None = None,
     ) -> tuple[str, bytes, str]:
         """
         Returns (html_content, pdf_bytes, narrative).
         """
+        # Only send non-PASS rows to the narrative AI — PASS rows are noise
+        # for the analyst summary and add unnecessary tokens.
+        notable_validations = [
+            vr for vr in case_result.validation_results
+            if vr.outcome != ValidationOutcome.PASS
+        ]
         narrative = await self._ai.generate_narrative(
             {
                 "application_id": case_result.application_id,
@@ -64,7 +72,7 @@ class ReportGenerator:
                         "outcome": vr.outcome,
                         "description": vr.description,
                     }
-                    for vr in case_result.validation_results
+                    for vr in notable_validations
                 ],
             }
         )
@@ -157,6 +165,20 @@ class ReportGenerator:
             doc_data_uris[dr.document_id] = f"data:{dms_doc.content_type};base64,{encoded}"
             doc_content_types[dr.document_id] = dms_doc.content_type
 
+        # Group validation results by outcome for the report table.
+        grouped_validations: dict[str, list] = defaultdict(list)
+        for vr in case_result.validation_results:
+            outcome = vr.outcome.value if hasattr(vr.outcome, "value") else str(vr.outcome)
+            grouped_validations[outcome].append(vr)
+        # Ordered for rendering: issues first, passes last.
+        validation_groups = [
+            ("Hard Breaches",             "HARD_BREACH",            grouped_validations.get("HARD_BREACH", [])),
+            ("Soft Mismatches",           "SOFT_MISMATCH",          grouped_validations.get("SOFT_MISMATCH", [])),
+            ("Low-Confidence Fields",     "LOW_CONFIDENCE",         grouped_validations.get("LOW_CONFIDENCE", [])),
+            ("Manual Review Required",    "MANUAL_REVIEW_REQUIRED", grouped_validations.get("MANUAL_REVIEW_REQUIRED", [])),
+            ("Passed Rules",              "PASS",                   grouped_validations.get("PASS", [])),
+        ]
+
         config_version = get_validation_config().version
 
         template = self._env.get_template("report.html")
@@ -181,8 +203,10 @@ class ReportGenerator:
             doc_data_uris=doc_data_uris,
             doc_content_types=doc_content_types,
             validation_results=case_result.validation_results,
+            validation_groups=validation_groups,
             manual_check_items=manual_check_items,
             technical_exceptions=technical_exceptions,
+            audit_timeline=audit_timeline or [],
             config_version=config_version,
             narrative=narrative,
         )

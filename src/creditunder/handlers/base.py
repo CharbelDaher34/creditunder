@@ -8,7 +8,6 @@ from creditunder.domain.enums import (
 )
 from creditunder.domain.models import (
     DocumentResult,
-    EmployerSnapshot,
     ExtractedField,
     RequiredDocumentSet,
     ValidationResult,
@@ -43,9 +42,8 @@ class BaseProductHandler(ABC):
         """Apply product validation rules.
 
         Returns `(validation_results, recommendation, rationale)`.
-        Each `ValidationResult` is stamped with `config_version` (and,
-        where applicable, `employer_rule_version`) so the audit trail is
-        reproducible across config / rules updates.
+        Each `ValidationResult` is stamped with `config_version` so the
+        audit trail is reproducible across config / rules updates.
         """
         ...
 
@@ -57,16 +55,8 @@ class BaseProductHandler(ABC):
     def _config(self) -> ValidationConfig:
         return get_validation_config()
 
-    def _stamp_versions(
-        self,
-        result: ValidationResult,
-        *,
-        employer: EmployerSnapshot | None = None,
-    ) -> ValidationResult:
-        cfg = self._config()
-        result.config_version = cfg.version
-        if employer is not None and result.employer_rule_version is None:
-            result.employer_rule_version = employer.rule_version
+    def _stamp_versions(self, result: ValidationResult) -> ValidationResult:
+        result.config_version = self._config().version
         return result
 
     def _low_confidence_check(

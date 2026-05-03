@@ -162,6 +162,7 @@ async def get_case(
         employer_snapshot=p.get("employer_snapshot"),
         documents=[DocumentDetail(**d) for d in p.get("documents", [])],
         validations=ValidationGroups(
+            passed=[ValidationDetail(**v) for v in valids.get("passed", [])],
             hard_breach=[ValidationDetail(**v) for v in valids.get("hard_breach", [])],
             soft_mismatch=[ValidationDetail(**v) for v in valids.get("soft_mismatch", [])],
             low_confidence=[ValidationDetail(**v) for v in valids.get("low_confidence", [])],

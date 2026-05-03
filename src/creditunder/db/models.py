@@ -164,11 +164,7 @@ class ValidationResultRow(Base):
     expected_value: Mapped[str | None] = mapped_column(Text, nullable=True)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     manual_review_required: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Version stamps — every rule outcome is reproducible across config
-    # and employer-rules updates by recording exactly which version was
-    # in force when the row was written. See BR-03 / BR-15 / BR-30.
     rule_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    employer_rule_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
     config_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
     evaluated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
