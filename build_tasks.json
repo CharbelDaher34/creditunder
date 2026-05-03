@@ -1,0 +1,281 @@
+{
+  "project": "AI Credit Underwriting Platform — Alinma Bank",
+  "description": "Sequential build plan to recreate the project from scratch. Tasks are ordered by dependency: each phase must be complete before the next begins.",
+  "phases": [
+    {
+      "phase": 1,
+      "name": "Project Bootstrap & Tooling",
+      "tasks": [
+        {
+          "id": "1.1",
+          "title": "Create Azure DevOps repo and connect to OpenShift cluster",
+          "details": "Create a new Azure DevOps Git repository for the project. Configure the OpenShift cluster integration: set up a service account with the necessary RBAC, create a pipeline service connection in Azure DevOps pointing to the cluster, and verify the connection with a test pipeline run. Set up branch policies on main (require PR + CI green before merge).",
+          "deliverables": [
+            "Azure DevOps repo",
+            "OpenShift service connection",
+            "branch policies"
+          ]
+        },
+        {
+          "id": "1.2",
+          "title": "Project scaffold — dependencies, config, and tooling",
+          "details": "Clone repo locally. Create the full directory layout: src/creditunder/, mockups/dms/, mockups/crm/. Add .gitignore (Python, .env, __pycache__). Set up pyproject.toml with uv targeting Python 3.14 — deps: sqlalchemy[asyncio], asyncpg, aiokafka, pydantic, pydantic-settings, pydantic-ai, fastapi, uvicorn, jinja2, weasyprint, structlog, httpx, python-multipart. Author .env.example with DMS_IP, CRM_IP, KAFKA_TOPIC, KAFKA_CONSUMER_GROUP, OPENAI_API_KEY, AI_BASE_URL, AI_API_KEY, AI_MODEL, DMS_BASE_URL, CRM_BASE_URL. Implement src/creditunder/config.py with pydantic-settings. Commit and push.",
+          "deliverables": [
+            "pyproject.toml",
+            "uv.lock",
+            ".env.example",
+            "config.py",
+            ".gitignore"
+          ]
+        },
+        {
+          "id": "1.3",
+          "title": "Configure structlog",
+          "details": "src/creditunder/observability.py: configure structlog with JSON output to stdout, standard fields on every entry (application_id, event_id, trace_id, span_id, component, log_level, timestamp, message). Provide get_logger().",
+          "deliverables": [
+            "src/creditunder/observability.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 2,
+      "name": "Domain Model & Validation Configuration",
+      "tasks": [
+        {
+          "id": "2.1",
+          "title": "Define enums and domain models",
+          "details": "domain/enums.py: ProductType (PERSONAL_FINANCE, AUTO_FINANCE, CREDIT_CARD, REAL_ESTATE_MORTGAGE), DocumentType (ID_DOCUMENT, SALARY_CERTIFICATE, ... other documents), ValidationOutcome (PASS, HARD_BREACH, SOFT_MISMATCH, LOW_CONFIDENCE, MANUAL_REVIEW_REQUIRED), Recommendation (NO_ISSUES, HOLD, DECLINE), CaseStatus (CREATED, IN_PROGRESS, COMPLETED, FAILED, MANUAL_INTERVENTION_REQUIRED, SUPERSEDED), DocumentStatus, CaseReportStatus, InboundEventStatus, JobType, JobStatus. domain/models.py: ExtractedField[T] (value, confidence, source_document_name, page_reference, normalized_label), DocumentResult, CaseResult, ApplicationEvent, EmployerSnapshot (employer_id, employer_name_normalized, employer_class A/B/C/D/GOV), RequiredDocumentSet, ValidationResult. Refer to credit_underwriting_system_requirement.md §6.1–6.4 for the exact enum values, field definitions, and model contracts (including the CaseResult and ValidationResult schemas).",
+          "deliverables": [
+            "domain/enums.py",
+            "domain/models.py"
+          ]
+        },
+        {
+          "id": "2.2",
+          "title": "Validation configuration YAML and loader",
+          "details": "validation_config.yaml: version string, confidence_thresholds (default + per DocumentType), per-product numeric tolerances (e.g. personal_finance.salary_deviation_tolerance), recommendation_mapping (on_hard_breach, on_manual_review, on_soft_mismatch, on_low_confidence, default). validation_config.py: pydantic schema for the YAML, get_validation_config() cached instance, fail at startup if confidence_thresholds.default is missing. Refer to credit_underwriting_system_requirement.md §8.3 for the exact YAML structure, the reproducibility contract (config_version stamping), and the rule about what does NOT belong in the file.",
+          "deliverables": [
+            "validation_config.yaml",
+            "validation_config.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 3,
+      "name": "Database Layer",
+      "tasks": [
+        {
+          "id": "3.1",
+          "title": "Database layer — ORM models and session",
+          "details": "db/models.py: all tables — InboundApplicationEvent, ApplicationCase, CaseDocument, StageOutputVersion, ValidationResultRow, CaseResult, CaseReport, DmsArtifact, ProcessingJob, DeadLetterEvent, EdwStaging, AuditEvent (RANGE-partitioned on occurred_at, composite PK id+occurred_at). Promote columns on EdwStaging: validator_id, supervisor_id, status, recommendation, product_type, applicant_name, pdf_dms_document_id. db/session.py: single AsyncSessionLocal bound to DATABASE_URL. Refer to credit_underwriting_system_requirement.md §8 for the full column-level schema of every table, FK constraints, append-only vs. mutable-status distinctions, and the edw_staging design rationale.",
+          "deliverables": [
+            "db/models.py",
+            "db/session.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 4,
+      "name": "Document Extraction Schemas",
+      "tasks": [
+        {
+          "id": "4.1",
+          "title": "BaseExtractionSchema and verify+extract engine",
+          "details": "documents/base.py: BaseExtractionSchema (pydantic) with built-in verification fields common to every document type — is_correct_type: bool, verification_confidence: ExtractedField[float], detected_type: ExtractedField[str], verification_notes: Optional[ExtractedField[str]]. Abstract class methods: document_type(), extraction_prompt(), verification_prompt(). The base class encodes the single-call verify+extract pattern: one AI call returns both verification outcome and extracted fields in the same typed response.",
+          "deliverables": [
+            "documents/base.py"
+          ]
+        },
+        {
+          "id": "4.2",
+          "title": "Per-document-type extraction schemas",
+          "details": "Research and define a schema for each DocumentType. For each type: audit the actual document to identify all extractable fields, wrap every field in ExtractedField[T], define verification_prompt() (what makes this document valid / what disqualifies it) and extraction_prompt() (field-level instructions, date formats, currency, derived fields). MVP schemas to implement: ID_DOCUMENT (full_name, id_number, date_of_birth, expiry_date, nationality, gender), SALARY_CERTIFICATE (employee_name, employer_name, basic_salary, housing_allowance, transport_allowance, total_salary, issue_date, job_title). Remaining types to be defined per backlog: SALARY_TRANSFER_LETTER, SUBSCRIPTION_WAGE_CERTIFICATE, HEALTH_CHECK_FORM, INSURANCE_FORM. Refer to credit_underwriting_system_requirement.md §6.2 for the canonical field list per document type and the ExtractedField[T] wrapper contract.",
+          "deliverables": [
+            "documents/id_document.py",
+            "documents/salary_certificate.py",
+            "documents/<remaining_types>.py"
+          ]
+        },
+        {
+          "id": "4.3",
+          "title": "EXTRACTION_SCHEMA_REGISTRY",
+          "details": "documents/__init__.py: EXTRACTION_SCHEMA_REGISTRY mapping DocumentType → schema class. Used by the AI client and handlers to resolve the correct schema for any given document type.",
+          "deliverables": [
+            "documents/__init__.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 5,
+      "name": "External Service Clients",
+      "tasks": [
+        {
+          "id": "5.1",
+          "title": "AI Client",
+          "details": "src/creditunder/services/ai_client.py: AIClient using pydantic-ai. verify_and_extract(document_content, content_type, document_name, expected_type) returns VerifyAndExtractResult (is_correct_type, verification_confidence, detected_type, extracted_fields). generate_narrative(case_summary) at temperature=0.3; everything else temperature=0. Configurable backend (OpenAI / OpenAI-compatible). Refer to credit_underwriting_system_requirement.md §7 for the three AI call points (verification, extraction, narrative), their inputs/outputs, and the single-endpoint design rationale.",
+          "deliverables": [
+            "src/creditunder/services/ai_client.py"
+          ]
+        },
+        {
+          "id": "5.2",
+          "title": "DMS Client",
+          "details": "src/creditunder/services/dms_client.py: fetch_document(dms_id), upload_document(content, metadata). httpx async client. Base URL resolved from DMS_BASE_URL (which uses DMS_IP).",
+          "deliverables": [
+            "src/creditunder/services/dms_client.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 6,
+      "name": "Product Handlers",
+      "tasks": [
+        {
+          "id": "6.1",
+          "title": "BaseProductHandler",
+          "details": "src/creditunder/handlers/base.py: ABC with required_documents(applicant_data) → RequiredDocumentSet, validate(...). _stamp_versions() writes config_version onto every ValidationResult. Refer to credit_underwriting_system_requirement.md §6.1 for the full BaseProductHandler contract, method signatures, and the RequiredDocumentSet dataclass definition.",
+          "deliverables": [
+            "src/creditunder/handlers/base.py"
+          ]
+        },
+        {
+          "id": "6.2",
+          "title": "PersonalFinanceHandler",
+          "details": "src/creditunder/handlers/personal_finance.py: rules ID_NUMBER_MISMATCH, ID_NAME_CHECK, ID_EXPIRED, SALARY_EMPLOYER_MATCH, SALARY_DEVIATION (tolerance from yaml). BR-13 employer-class doc matrix: Class A → ID + Salary Cert; Class B → ID + Salary Cert + Salary Transfer Letter; Class C/D → ID + Subscription & Wage Cert. Refer to credit_underwriting_system_requirement.md §5.1 for the employer_snapshot sub-schema and §6.1 for the required_documents branching pattern. The applicant_data field names used in cross-checks (name, id_number, declared_salary, employer) are defined in §5.",
+          "deliverables": [
+            "src/creditunder/handlers/personal_finance.py"
+          ]
+        },
+        {
+          "id": "6.3",
+          "title": "Handler registry",
+          "details": "src/creditunder/handlers/registry.py: get_handler(ProductType) → handler instance.",
+          "deliverables": [
+            "src/creditunder/handlers/registry.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 7,
+      "name": "Pipeline & Report Generator",
+      "tasks": [
+        {
+          "id": "7.1",
+          "title": "Report HTML template",
+          "details": "src/creditunder/pipeline/templates/report.html: WeasyPrint-optimized Jinja2 template — 4-col validation table, two-column doc layout (CSS table), page-break guards, neutral-grey dashed-border Technical Exceptions panel. Refer to credit_underwriting_system_requirement.md §12.2.3 for the full list of panels the report must include (applicant summary, document panel, validation groups, manual checks, technical exceptions, recommendation block) and the visual distinction rules (BR-37) between technical exceptions and business-rule outcomes.",
+          "deliverables": [
+            "pipeline/templates/report.html"
+          ]
+        },
+        {
+          "id": "7.2",
+          "title": "ReportGenerator",
+          "details": "src/creditunder/pipeline/report_generator.py: AIClient.generate_narrative → Jinja2 HTML → WeasyPrint PDF. Embed each source doc fetched from DMS as base64 data URI for self-contained PDF. Persist html_content; upload PDF to DMS; set pdf_dms_document_id.",
+          "deliverables": [
+            "pipeline/report_generator.py"
+          ]
+        },
+        {
+          "id": "7.3",
+          "title": "ApplicationProcessor",
+          "details": "src/creditunder/pipeline/processor.py: Kafka consumer + orchestration. _recover_stuck_cases() at startup marks CREATED/IN_PROGRESS as FAILED. Per message: dedupe on event_id, create/find ApplicationCase, fetch+verify+extract documents concurrently via asyncio.gather, completeness check, handler.validate(), set COMPLETED + recommendation, ReportGenerator.generate(), set completed_at after PDF upload, _write_edw_staging() snapshot. Resubmission policy: same application_id, new event_id → mark prior SUPERSEDED, create new case. Refer to credit_underwriting_system_requirement.md §9 for the full end-to-end sequence diagram, §11 for failure handling per stage (what goes to dead_letter_event, what stays retryable), and §11.2 for the resubmission policy. The Kafka event contract (all required fields) is in §5.",
+          "deliverables": [
+            "pipeline/processor.py"
+          ]
+        },
+        {
+          "id": "7.4",
+          "title": "Entrypoint",
+          "details": "src/creditunder/__main__.py → asyncio.run(ApplicationProcessor.run()).",
+          "deliverables": [
+            "src/creditunder/__main__.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 8,
+      "name": "Mockup Services",
+      "tasks": [
+        {
+          "id": "8.1",
+          "title": "DMS mockup",
+          "details": "mockups/dms/app.py: FastAPI bound to DMS_IP, disk-backed /data. Endpoints: GET /documents/{id}, GET /documents/{id}/raw, POST /documents (base64 JSON), GET /documents, GET /health. Pre-seed DMS-00192 (national ID), DMS-00193 (salary cert).",
+          "deliverables": [
+            "mockups/dms/app.py"
+          ]
+        },
+        {
+          "id": "8.2",
+          "title": "CRM mockup app + publisher",
+          "details": "mockups/crm/app.py: FastAPI bound to CRM_IP, POST /publish → Kafka producer. mockups/crm/publisher.py: CLI publishing to credit-applications topic. mockups/crm/sample_data.py: SAMPLE_EVENTS — APP-2026-089341 (happy path APPROVE) and APP-2026-089342 (salary mismatch HOLD). Both with employer_snapshot Class A Saudi Aramco. Refer to credit_underwriting_system_requirement.md §5 for the complete Kafka event schema that each sample event must conform to.",
+          "deliverables": [
+            "mockups/crm/app.py",
+            "publisher.py",
+            "sample_data.py"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 9,
+      "name": "Containerization & Orchestration",
+      "tasks": [
+        {
+          "id": "9.1",
+          "title": "Processor Dockerfile and entrypoint",
+          "details": "src/creditunder/Dockerfile (Python 3.14, uv sync, copy src). src/creditunder/entrypoint.sh: wait for postgres+kafka, exec python -m creditunder.",
+          "deliverables": [
+            "Dockerfile",
+            "entrypoint.sh"
+          ]
+        },
+        {
+          "id": "9.2",
+          "title": "docker-compose stack",
+          "details": "docker-compose.yml services: postgres (primary, internal-only), kafka (apache/kafka:3.7.2 KRaft, internal-only), processor, dms (bound to DMS_IP), crm (bound to CRM_IP). Set DATABASE_URL and KAFKA_BOOTSTRAP_SERVERS in environment blocks (NOT .env). DMS and CRM expose their service via the configured IPs.",
+          "deliverables": [
+            "docker-compose.yml"
+          ]
+        },
+        {
+          "id": "9.3",
+          "title": "Makefile",
+          "details": "Targets: infra (start everything + processor), infra-bg (detached, no processor), down, logs, fmt, lint.",
+          "deliverables": [
+            "Makefile"
+          ]
+        }
+      ]
+    },
+    {
+      "phase": 10,
+      "name": "Documentation & Smoke Verification",
+      "tasks": [
+        {
+          "id": "10.1",
+          "title": "CLAUDE.md and README",
+          "details": "Author CLAUDE.md (project overview, commands, architecture, design constraints) and a brief README pointing to it.",
+          "deliverables": [
+            "CLAUDE.md",
+            "README.md"
+          ]
+        },
+        {
+          "id": "10.2",
+          "title": "End-to-end smoke run",
+          "details": "make infra → publish APP-2026-089341 (expect APPROVE) and APP-2026-089342 (expect HOLD). Verify edw_staging rows and PDFs uploaded to DMS.",
+          "deliverables": [
+            "smoke verification log"
+          ]
+        }
+      ]
+    }
+  ]
+}
