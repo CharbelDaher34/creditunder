@@ -119,10 +119,24 @@ The Kafka message that starts processing must carry:
 | `application_id` | string | Business identifier for the credit application in Siebel CRM. |
 | `product_type` | string | Value of the `ProductType` enum — used to resolve the product handler class. If the value does not match a registered handler, the event is rejected immediately and written to `dead_letter_event`. |
 | `branch_name` | string | The name of the bank branch where the application was submitted. Stored for audit and reporting purposes only — not used in processing logic. |
-| `validator_id` | string | The Siebel CRM user ID of the bank staff member submitting the application. Stored for ownership traceability and audit. This is the person who submitted the application in CRM, not necessarily the person who will review the final report. |
-| `supervisor_id` | string | The Siebel CRM user ID of the supervisor of the submitting validator. Stored for ownership hierarchy and UI access control. |
+| `validator_id` | string | The Siebel CRM user ID of the bank staff member who will **review** this case in the Workbench. Used for ownership scoping (the Workbench restricts each Validator to cases where `application_case.validator_id == user_id`). |
+| `supervisor_id` | string | The Siebel CRM user ID of the supervisor of the reviewing validator. Stored for ownership hierarchy and UI access control. |
 | `document_ids` | array of string | List of DMS document identifiers to fetch and process. Each entry resolves to one document. The Product Handler determines which document types it requires; documents not required by the handler are silently ignored. |
-| `applicant_data` | object | The applicant's records as held by Siebel CRM at submission time, including all fields pre-fetched from external systems (e.g. SIMAH score, SIMATI data, T24 account details, name, ID number, date of birth, employer, salary). Carried in the event so the system can cross-check extracted document fields without ever calling any external system directly. |
+| `applicant_data` | object | The applicant's records as held by Siebel CRM at submission time, including all fields pre-fetched from external systems (e.g. SIMAH score, SIMATI data, T24 account details, name, ID number, date of birth, employer, salary). Carried in the event so the system can cross-check extracted document fields without ever calling any external system directly. **Must include an `employer_snapshot` sub-object** — see schema below. |
+
+#### 5.1 `applicant_data.employer_snapshot` sub-schema
+
+The Personal Finance handler (and any future product handler that varies its required-document set or rules by employer) reads the employer context from this sub-object. CRM resolves the employer record against the governed employer-rules source (BR-11 / BR-16) and embeds the snapshot at publish time so the processor never fetches employer data itself. The `rule_version` and `rule_source_date` fields are stamped onto every `validation_result` row that consumed employer data, so the audit trail is reproducible across rule updates (BR-15 / BR-30).
+
+| Field | Type | Description |
+|---|---|---|
+| `employer_id` | string | Canonical employer identifier from the rules source. |
+| `employer_name_normalized` | string | Canonical normalised name — used as the comparison anchor for the employer-name validation (BR-07). |
+| `employer_class` | enum (`A`, `B`, `C`, `D`, `GOV`) | Employer class assigned by the governed rules source. Drives the required-document matrix (BR-13 / BR-14). |
+| `active_restrictions` | array of string | Restriction codes currently in force for this employer (e.g. `NEW_HIRES_BLOCKED`). |
+| `max_limit_note` | string \| null | Free-form note on max-limit policy if any. |
+| `rule_version` | string | Identifier of the employer-rules version that produced this snapshot. |
+| `rule_source_date` | date (YYYY-MM-DD) | When the snapshot was produced by CRM. |
 
 **Example event payload:**
 
@@ -142,12 +156,21 @@ The Kafka message that starts processing must carry:
     "employer": "Saudi Aramco",
     "declared_salary": 18500.00,
     "simah_score": 720,
-    "t24_account_id": "T24-ACC-998821"
+    "t24_account_id": "T24-ACC-998821",
+    "employer_snapshot": {
+      "employer_id": "EMP-ARAMCO",
+      "employer_name_normalized": "SAUDI ARAMCO",
+      "employer_class": "A",
+      "active_restrictions": [],
+      "max_limit_note": null,
+      "rule_version": "2026.04",
+      "rule_source_date": "2026-04-15"
+    }
   }
 }
 ```
 
-> **To be confirmed with infrastructure team before implementation:** Kafka message key (recommended: `application_id` for partition locality), correlation ID header for distributed tracing, and event schema version field for forward compatibility.
+> **To be confirmed with infrastructure team before implementation:** Kafka message key (recommended: `application_id` for partition locality) and event schema version field for forward compatibility.
 
 > **To be confirmed with DMS integration team before implementation:** The mechanism by which `DocumentType` is resolved for each `document_id`. The system assumes DMS metadata includes the uploader-assigned document type label. If it does not, an additional classification step is required before verification can begin.
 
@@ -155,7 +178,9 @@ The Kafka message that starts processing must carry:
 
 ### 6. Code Model
 
-Product and document behaviour is modelled in code — not in the database. Each product type has a dedicated handler class; each document type has a dedicated Pydantic model.
+Product and document behaviour is modelled in code — not in the database. Each product type has a dedicated handler class; each document type has a dedicated Pydantic model. **Numeric thresholds and the recommendation mapping live in `validation_config.yaml`** — see Section 8.3 — so they can be tuned without a code deployment, while the validation *logic* (which rules exist, how they branch on the data) stays under code review.
+
+> **MVP coverage callout.** The enums below are illustrative of the patterns; the production scope per the BRD is broader (Personal Finance, Credit Cards, Auto Lease, Real Estate Mortgage; ID, Salary Certificate, Salary Transfer Letter, Subscription & Wage Certificate, Health-Check Form, Insurance Form). The MVP implements `PERSONAL_FINANCE` (+ `AUTO_FINANCE` placeholder) and `ID_DOCUMENT` + `SALARY_CERTIFICATE`. Adding the remaining product handlers and document extraction schemas is scoped as backlog and follows the extension recipe in Section 6.1 / 6.2.
 
 #### 6.1 Product types
 
@@ -167,30 +192,52 @@ class ProductType(str, Enum):
     AUTO_FINANCE = "AUTO_FINANCE"
 
 
+@dataclass
+class RequiredDocumentSet:
+    # The handler tells the Application Processor what to expect *for this applicant*,
+    # because the required set may depend on `applicant_data` — most importantly
+    # the employer class snapshot (BR-13 / BR-14).
+    required: set[DocumentType]                  # must all be present
+    optional: set[DocumentType] = set()          # accepted if present, ignored if absent
+    unsupported: set[DocumentType] = set()       # must not be present; flagged if uploaded
+
+
 class BaseProductHandler(ABC):
     product_type: ProductType  # declares which product this handler owns
 
-    @property
     @abstractmethod
-    def required_documents(self) -> set[DocumentType]:
-        # Each handler declares the document types it needs.
-        # The Application Processor uses this list to check completeness before starting.
+    def required_documents(self, applicant_data: dict) -> RequiredDocumentSet:
+        # Each handler declares the document set it needs *given the applicant
+        # context*. Personal Finance, for example, branches on
+        # `applicant_data["employer_snapshot"].employer_class`:
+        #   Class A   → ID + Salary Certificate
+        #   Class B   → ID + Salary Certificate + Salary Transfer Letter
+        #   Class C/D → ID + Subscription & Wage Certificate
+        # The Application Processor uses the returned set to check completeness
+        # before invoking validate().
         raise NotImplementedError
 
     @abstractmethod
-    def handle_application(self, application_id: str) -> "CaseResult":
+    def validate(
+        self,
+        application_id: str,
+        applicant_data: dict,
+        document_results: list[DocumentResult],
+    ) -> tuple[list[ValidationResult], Recommendation, str]:
         """
-        Single entry point for processing one application.
+        Single entry point for product-specific validation.
 
-        For each document this handler requires, it:
-          1. Fetches the document from DMS
-          2. Calls AI Service to verify the document type matches what is expected
-          3. Calls AI Service to extract structured data into the typed Pydantic model
-          4. Applies product-specific business rules to the extracted data and applicant_data
+        Receives the document results already produced by the Application Processor
+        (each one has been fetched, verified, and extracted) and applies product
+        business rules across them and `applicant_data`. Aggregates rule outcomes
+        into a list of ValidationResult, derives a Recommendation, and emits a
+        free-form rationale string. The Application Processor never iterates
+        documents and never calls AI Service directly — that is the handler's
+        responsibility upstream of validate().
 
-        Aggregates all document-level outcomes into a CaseResult and returns it.
-        The Application Processor never iterates documents and never calls AI Service
-        directly — that is the handler's responsibility.
+        Every ValidationResult is stamped with `config_version` (and, where the
+        rule consumed employer data, `employer_rule_version`) so the audit trail
+        is reproducible across config / rules updates.
         """
         raise NotImplementedError
 ```
@@ -338,9 +385,9 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `event_id` | UUID NOT NULL FK → `inbound_application_event.event_id` | Enforced via `fk_application_case_event_id` |
 | `product_type` | string NOT NULL | |
 | `branch_name` | string NOT NULL | |
-| `validator_id` | string NOT NULL | |
+| `validator_id` | string NOT NULL | The Workbench user who will review this case (not necessarily the submitter) |
 | `supervisor_id` | string NOT NULL | |
-| `applicant_data` | JSONB NOT NULL | Snapshot from the Kafka event — authoritative for this case |
+| `applicant_data` | JSONB NOT NULL | Snapshot from the Kafka event — authoritative for this case. Includes the `employer_snapshot` sub-object (Section 5.1) when the product handler needs employer context |
 | `status` | string NOT NULL | `CREATED` → `IN_PROGRESS` → `COMPLETED` (or `FAILED` / `MANUAL_INTERVENTION_REQUIRED`). `COMPLETED` means business processing produced a recommendation; delivery state lives on `case_report` and `edw_staging` |
 | `recommendation` | string | `APPROVE`, `HOLD`, `DECLINE` — set after handler completes |
 | `recommendation_rationale` | text | Free-form rationale string emitted alongside the recommendation |
@@ -400,6 +447,9 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `expected_value` | text | Value the rule expected (e.g. CRM record) |
 | `confidence` | float | AI confidence, if applicable |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
+| `rule_version` | string | Identifier of the handler rule logic that produced this row (when the rule itself is versioned). Nullable |
+| `employer_rule_version` | string | Set when the rule consumed `applicant_data.employer_snapshot`. Mirrors `EmployerSnapshot.rule_version` so the row can be traced back to the exact employer-rules version applied (BR-15) |
+| `config_version` | string | Mirrors `validation_config.yaml`'s `version` at evaluation time. Stamped automatically by the handler base class so threshold / mapping changes are reproducible (see Section 8.3) |
 | `evaluated_at` | timestamptz NOT NULL | |
 
 ---
@@ -485,18 +535,31 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 
 ---
 
-**`edw_staging`** — Complete final payload buffered before the EDW write.
+**`edw_staging`** — The settled final record for a completed application. Written once when the pipeline completes and kept permanently in sync with the EDW database table of the same structure. This table is the workbench's single source of truth: all case list and case detail queries read from here exclusively, never from the pipeline tables. The promoted scalar columns (`validator_id`, `recommendation`, `status`, etc.) support indexed filtering and role scoping without JSONB access; `payload` carries the full structured output for the detail view and for the EDW write.
 
 | Column | Type | Notes |
 |---|---|---|
 | `id` | UUID PK | |
 | `case_id` | UUID UNIQUE NOT NULL FK → `application_case` | |
-| `payload` | JSONB NOT NULL | Complete final output: extracted data + validations + report metadata |
-| `status` | string NOT NULL | `STAGED` (default) → `EXPORTED` / `EXPORT_FAILED`. `EXPORT_FAILED` rows are retried independently of the pipeline since `payload` already contains the settled output |
+| `application_id` | string NOT NULL | Business key — promoted for indexed lookup without JSONB access |
+| `validator_id` | string NOT NULL | Promoted from `application_case` — supports role-scoped queries |
+| `supervisor_id` | string NOT NULL | Promoted from `application_case` — supports role-scoped queries |
+| `product_type` | string NOT NULL | Promoted — supports dashboard filtering |
+| `branch_name` | string NOT NULL | Promoted — available for reporting without JSONB access |
+| `applicant_name` | string | Extracted from `applicant_data.name` at staging time — supports search |
+| `status` | string NOT NULL | Final case status at completion time |
+| `recommendation` | string | `APPROVE`, `HOLD`, `DECLINE` — promoted for dashboard filtering |
+| `manual_review_required` | boolean NOT NULL | Promoted — surfaces priority flag without JSONB access |
+| `pdf_dms_document_id` | string | DMS identifier of the uploaded PDF report |
+| `error_detail` | text | Top-level pipeline error if any, promoted for the workbench exceptions panel |
+| `payload` | JSONB NOT NULL | Complete denormalised output: applicant data, extracted fields, validation results, employer snapshot, manual checks, technical exceptions, report metadata, and audit timeline. This is the exact payload written to the EDW table — `edw_staging` and EDW always hold the same structure |
+| `export_status` | string NOT NULL | `STAGED` (default) → `EXPORTED` / `EXPORT_FAILED`. `EXPORT_FAILED` rows are retried independently of the pipeline since `payload` already contains the settled output |
 | `edw_confirmation_id` | string | Identifier returned by EDW on a successful write |
 | `staged_at` | timestamptz NOT NULL | |
 | `exported_at` | timestamptz | |
 | `export_error` | text | Failure description from the most recent EDW write attempt |
+| `created_at` | timestamptz NOT NULL | Mirrored from `application_case.created_at` — supports date-sorted dashboard queries |
+| `completed_at` | timestamptz | Mirrored from `application_case.completed_at` |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
 
 ---
@@ -541,6 +604,44 @@ The following indexes are required for the query patterns in the processing pipe
 - The migration creates partitions covering 2026-01 through ~18 months past the migration date and a `audit_event_default` catch-all so a missing future partition never silently drops audit rows.
 - Indexes (`ix_audit_event_case_id`, `ix_audit_event_occurred_at`, `ix_audit_event_case_time`) are declared on the parent table; PostgreSQL propagates them to all current and future partitions.
 - A scheduled maintenance job (e.g. `pg_partman` or a cron task) must extend the partition window before the last explicit partition fills.
+
+#### 8.3 Validation Configuration (`validation_config.yaml`)
+
+Validation **logic** lives in code (handlers); validation **numbers** live in YAML so they can be tuned without a code deployment. The file is bundled with the application and loaded once per process.
+
+```yaml
+version: "2026.05.01"
+
+# AI confidence threshold per document type. Fields below the applicable
+# threshold emit a LOW_CONFIDENCE validation row.
+confidence_thresholds:
+  default: 0.70
+  ID_DOCUMENT: 0.70
+  SALARY_CERTIFICATE: 0.70
+
+# Personal Finance numeric tolerances.
+personal_finance:
+  salary_deviation_tolerance: 0.10  # 10%
+
+# Recommendation mapping. Outcomes are evaluated in precedence order:
+#   HARD_BREACH > MANUAL_REVIEW_REQUIRED > SOFT_MISMATCH > LOW_CONFIDENCE > none
+recommendation_mapping:
+  on_hard_breach: DECLINE
+  on_manual_review: HOLD
+  on_soft_mismatch: HOLD
+  on_low_confidence: HOLD
+  default: APPROVE
+```
+
+**Reproducibility contract.** Every `validation_result` row is stamped with the `version` string above (`config_version` column). When the file changes:
+
+1. Bump `version` (any monotonic identifier — date-based works).
+2. Restart the processor to load the new file.
+3. New rows reference the new `config_version`; historical rows still reference whatever version was in force when they were written.
+
+This guarantees the BR-30 explainability PDF and the Workbench's checks table can always show *which* threshold version produced any given outcome.
+
+**What does NOT belong in this file.** The validation logic itself — which rules exist, how they branch on data, what `rule_code` they emit — is owned by the handler classes and stays under code review. The YAML carries only thresholds, tolerances, and the outcome→recommendation mapping. If a behavioural change requires a new rule or a new branch, that is a code change.
 
 ---
 
@@ -724,6 +825,8 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 `application_case.completed_at` is set **only** when both delivery sides (report uploaded, EDW exported) have succeeded. A NULL `completed_at` on a `COMPLETED` case is the unambiguous signal that something downstream is unresolved — the specific failure is on the relevant child row.
 
+**Tech-exception vs business-outcome visual distinction.** Pipeline / integration failures (anything written to `*.error_detail` or `edw_staging.export_error`) are surfaced in both the Workbench detail view and the BR-30 explainability PDF as a separate **Technical Exceptions** panel with a neutral grey, dashed-border palette — distinct from the business-outcome chips (green/amber/red) used for `ValidationOutcome`. This guarantees a reviewer never confuses a DMS outage or an AI 5xx with a rule decline (BR-37).
+
 ---
 
 #### 11.1 External system failures
@@ -742,7 +845,7 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 #### 11.2 Business / event contract failures
 
-**Same `application_id`, new `event_id`.** The system cannot determine whether this is a CRM retry or a deliberate resubmission. It must never silently overwrite a completed case. The business must define what constitutes a legitimate resubmission and whether it must carry a distinct event type or version flag.
+**Same `application_id`, new `event_id`.** When a new event arrives carrying an `application_id` that already exists — regardless of the prior case's status — the system treats it as a resubmission and processes it as a new case. The existing case row is superseded: its status is set to `SUPERSEDED` and the new event creates a fresh `application_case` row. This policy ensures CRM retries after a timeout or resubmissions after a correction are always honoured without requiring manual intervention. The previous case's audit trail, validation rows, and report remain intact and queryable.
 
 **Unsupported `product_type`.** Rejected at consumption, written to `dead_letter_event` with reason code `UNSUPPORTED_PRODUCT_TYPE`. Supporting a new product type requires only a new handler class — no other component changes.
 
@@ -770,7 +873,7 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 ### 12. Validator Workbench — Output Delivery Options
 
-Once the pipeline completes, the Validator and Supervisor need to access the case results and the PDF report. There are two architectural options for how this is delivered. **One must be chosen before implementation.** Both are described below with their tradeoffs.
+Once the pipeline completes, the Validator and Supervisor need to access the case results and the PDF report. There are two architectural options for how this is delivered. **Both options are viable given our data architecture: the pipeline already writes a complete denormalised snapshot to `edw_staging` (mirrored to EDW) and uploads the PDF to DMS, so the data required by either option is always available at completion.** Both are described below with their tradeoffs.
 
 ---
 
@@ -827,9 +930,7 @@ In this option, this team builds and operates a dedicated internal web applicati
 
 #### 12.1 Recommendation
 
-> **This decision must be made with the business and CRM team before implementation begins.**
-
-Option A is lower-effort but depends on the CRM team's willingness and ability to expose EDW data in their UI. Option B gives this team full control and a richer Validator experience, at the cost of building and operating a web application. If the CRM team cannot expose validation detail and real-time status from EDW, Option B is the only path to a complete Validator experience.
+Because the pipeline always produces both outputs — the PDF in DMS and the full structured payload in `edw_staging` / EDW — neither option requires a data architecture change. The choice is purely operational: whether the Validator experience is owned by the CRM team (Option A) or this team (Option B). Option A is lower-effort but depends on the CRM team's willingness and ability to surface EDW data in their UI. Option B gives this team full control and a richer Validator experience, at the cost of building and operating a web application. If the CRM team cannot expose validation detail and real-time status from EDW, Option B is the only path to a complete Validator experience.
 
 ---
 
@@ -879,11 +980,21 @@ Selecting a card opens the detail view. It shows the full picture of the case in
 - Extraction status
 - Per-field extracted values with their confidence scores (from `stage_output_version.extracted_data`)
 
-**Validation panel** — one row per rule in `validation_result`, grouped by outcome category:
+**Employer rules panel** — when `applicant_data.employer_snapshot` is present, shows employer name, class, active restrictions, max-limit note, and the rule version + source date that produced the snapshot (BR-15).
+
+**Document completeness panel** — required documents (resolved by the handler from `applicant_data`), received documents, missing documents (BR-12).
+
+**Validation panel** — one row per rule in `validation_result`, grouped by outcome category. Each row carries a per-check **evidence drill-down** (BR-31): the field name, extracted value, expected value (from CRM / employer-rule snapshot / structured source), confidence score, and a deep link to the source document page so the reviewer can challenge any check directly.
 - HARD_BREACH entries shown first with full details and failing condition
 - SOFT_MISMATCH entries showing expected vs. actual values
 - LOW_CONFIDENCE entries showing the field, extracted value, and confidence score
 - MANUAL_REVIEW_REQUIRED entries listed with the reason for manual review
+
+**Manual checks panel** (BR-30 / BR-33) — aggregates everything that requires a human verdict in one place:
+- Rule-driven items: any `validation_result` row with `manual_review_required = true` or `outcome = MANUAL_REVIEW_REQUIRED`, deduplicated by `rule_code`.
+- One **stamp / signature visual review** entry per source document. The system renders the document image and the reference record but never produces an automated verdict for these checks in the MVP. The reviewer ticks them off manually.
+
+**Technical Exceptions panel** (BR-36 / BR-37) — collects every `*.error_detail` and `edw_staging.export_error` for the case. Rendered with a visually distinct palette (neutral grey, dashed border) so an integration or extraction failure is never confused with a business-rule outcome. A non-empty panel does not change the recommendation; it tells the reviewer something downstream is unresolved.
 
 **Recommendation block** — the system recommendation (APPROVE / HOLD / DECLINE) displayed prominently, with a manual review flag if `case_result.manual_review_required = true`.
 
