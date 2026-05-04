@@ -27,7 +27,7 @@ The Validator's role shifts from manual data gathering to reviewing a pre-assemb
 
 ### 1. Purpose and Context
 
-This platform automates credit application processing at Alinma Bank. When Siebel CRM submits a credit application event to Kafka, the system:
+This platform automates credit application processing at Alinma Bank. When the source system (Siebel CRM in the MVP) submits a credit application event — over Kafka or a REST API call to our inbound endpoint — the system:
 
 1. Fetches the application documents from DMS.
 2. Verifies each document matches its declared type (using AI).
@@ -51,7 +51,7 @@ The platform is built on four fixed pillars:
 
 | Participant | Role |
 |---|---|
-| **Siebel CRM** | Two interactions with this system: **(1) Event publisher** — triggers processing by publishing to Kafka with `applicant_data` and document identifiers. **(2) Output consumer** — reads the final PDF report from DMS and the structured case data from EDW once the pipeline completes. Siebel never calls this system's API and is never called by this system during processing. |
+| **Siebel CRM** | Two interactions with this system: **(1) Event publisher** — triggers processing by publishing a credit-application event (over Kafka or a REST call to our inbound endpoint) with `applicant_data` and document identifiers. **(2) Output consumer** — reads the final PDF report from DMS and the structured case data from EDW once the pipeline completes, plus an optional completion notification (Section 13.6). The exact direction of calls (Siebel → us, or us → Siebel for a Pattern C pull or a REST callback) depends on the integration pattern chosen in Section 13. |
 | **Kafka** | Event bus that buffers application-processing events and decouples Siebel CRM from pipeline latency. Events are durable and replayable. |
 | **Application Processor** | Consumes Kafka events, creates the case in Postgres, invokes the product handler, receives the `CaseResult`, delegates report generation, and writes the final output to EDW. It coordinates the pipeline — it contains no business logic. |
 | **Product Handler** | One class per `ProductType`. Owns the required document list, extraction routing, validation rules, and recommendation logic for that product. The Application Processor is unaware of product-specific rules. |
@@ -69,7 +69,7 @@ The platform is built on four fixed pillars:
 
 | Decision | Rationale |
 |---|---|
-| **Kafka-only event trigger** | Siebel CRM publishes to Kafka — no synchronous API can start processing. Provides durable, replayable delivery and decouples CRM from pipeline latency. If the processing system is down, events queue safely in Kafka with no data loss. |
+| **Async, transport-flexible event trigger** | The source system publishes a trigger event over Kafka (default) or a REST API call to our inbound endpoint. Both produce the same internal event and converge on the same pipeline (see Section 5 and Section 13.1). The Kafka path provides durable, replayable delivery — events queue safely if the processor is down. The REST path is offered for source systems that don't run a Kafka producer; it has no durable buffer on our side, so producers using REST own retry on transient errors. |
 | **AI Service as the unified service** | A single AI Service endpoint handles document verification, extraction, and narrative generation. This avoids managing multiple AI infrastructure components and standardises prompt engineering, model versioning, and monitoring under one service. |
 | **Document type verification before extraction** | Before extracting data, AI Service confirms the document visually matches its declared type (e.g. the file labelled SALARY_CERTIFICATE is actually a salary certificate). This catches mismatched or corrupted uploads early — before they produce misleading extraction results. |
 | **Product handler strategy pattern** | `ProductType` resolves to one handler class that owns all business rules for that product. The Application Processor only coordinates; adding a new product requires only a new class with no changes to the Application Processor or any other component. |
@@ -91,10 +91,10 @@ Every decision above relies on assumptions that are not derivable from the code 
 | AI Service supports structured output: given a system prompt and a Pydantic model schema, it returns a JSON response that can be validated against that schema. | Extraction uses typed Pydantic models. If AI Service cannot guarantee structured output, a parsing and fallback layer would be required. |
 | DMS exposes document metadata including the `DocumentType` label set by the uploader. | The Product Handler uses this label as the `expectedDocumentType` in the AI verification call. If DMS does not expose this, the handler cannot determine which verification and extraction prompt to apply without an additional classification step. |
 | DMS document identifiers are stable: a `documentId` that exists today will still exist and return the same document when retried minutes later. | Retry logic re-fetches documents by `documentId`. If DMS IDs are ephemeral or mutable, retries could fetch wrong documents. |
-| `applicant_data` carried in the Kafka event is the authoritative version of the applicant's record at submission time. | The system never calls Siebel CRM after consuming the event. If CRM records change after submission, this system processes the snapshot at submission time — not the updated version. |
+| `applicant_data` carried in the inbound event is the authoritative version of the applicant's record at the moment the pipeline starts. | Under Pattern A (Section 13.2) the system never calls Siebel CRM after consuming the event — it processes the snapshot at publish time, not any later CRM update. Under Pattern C (Section 13.4) the snapshot is taken when the Source Adapter performs its synchronous fetch, so it reflects source-system state at processing time. |
 | The number of product types and document types is small and changes infrequently. | These are modelled in code, not in config tables. If the business requires non-developer-configurable product or document definitions, this design must be revised to support a database-driven configuration layer. |
-| The internal UI (Section 12) is a read-only portal. No case actions (approve, reject, override) are taken through the UI — those happen in Siebel CRM. | The UI backend exposes read-only API endpoints. No write operations are needed on the UI path. |
-| All external reference data required for validation — including SIMAH credit scores, SIMATI records, T24 account data, and any other bank-managed data source — is pre-fetched by Siebel CRM and included in `applicant_data` at event submission time. | The platform never calls external data providers directly. If a required field is absent from `applicant_data`, validation cannot run for that field. The Kafka event schema must be extended at source before new cross-check rules can be applied. |
+| If Option B (Section 12) is chosen, the internal UI is a read-only portal — no case actions (approve, reject, override) are taken there; those happen in Siebel CRM. Under Option A there is no internal UI at all and Siebel CRM is the sole reviewer surface. | The UI backend, when present, exposes read-only API endpoints. No write operations are ever needed from the reviewer experience. |
+| All external reference data required for validation — including SIMAH credit scores, SIMATI records, T24 account data, and any other bank-managed data source — is fully populated in `applicant_data` by the time the Application Processor runs. **Under Pattern A** (Section 13.2) the source system pre-fetches and embeds them at publish time. **Under Patterns B/C** (Sections 13.3 / 13.4) they may be embedded by the originating producer or fetched live by the Source Adapter from CRM / T24 read APIs. | The Application Processor itself never calls SIMAH / SIMATI / T24 directly — that logic, if needed, lives in the Source Adapter. If a required field is absent from `applicant_data` when the pipeline starts, validation cannot run for that field; the inbound event schema (or the adapter's fetch list) must be extended at the source before new cross-check rules can be applied. |
 | The AI Service is deployed within the bank's on-premises infrastructure boundary. No applicant data, document content, or extracted field values leaves the bank's network at any point in the pipeline. | There are no data-residency or data-exfiltration constraints on the AI integration under this assumption. If the AI deployment model changes to a cloud-hosted provider, a full data classification and privacy review must be completed before integration proceeds. |
 
 ---
@@ -430,7 +430,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 
 #### Tables
 
-**`inbound_application_event`** — One row per Kafka event received. Used for deduplication.
+**`inbound_application_event`** — One row per inbound event received (over Kafka or via REST). Used for deduplication.
 
 > **FK note:** `application_case.event_id` references `inbound_application_event.event_id` (the business deduplication key, declared UNIQUE), not `inbound_application_event.id` (the surrogate PK). This makes event tracing natural without a join on the surrogate key.
 
@@ -440,7 +440,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `event_id` | UUID UNIQUE NOT NULL | Deduplication key — checked at consumption time |
 | `application_id` | string NOT NULL | Business key from CRM |
 | `product_type` | string | Resolved from the event payload at ingest |
-| `raw_payload` | JSONB NOT NULL | Full Kafka message stored for replay |
+| `raw_payload` | JSONB NOT NULL | Full inbound payload stored for replay |
 | `received_at` | timestamptz NOT NULL | |
 | `status` | string NOT NULL | `RECEIVED` (default) → `PROCESSING` → `COMPLETED` / `FAILED` |
 | `updated_at` | timestamptz NOT NULL | Last status transition timestamp |
@@ -462,8 +462,8 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `branch_name` | string NOT NULL | |
 | `validator_id` | string NOT NULL | The Workbench user who will review this case (not necessarily the submitter) |
 | `supervisor_id` | string NOT NULL | |
-| `applicant_data` | JSONB NOT NULL | Snapshot from the Kafka event — authoritative for this case. Includes the `employer_snapshot` sub-object (Section 5.1) when the product handler needs employer context |
-| `status` | string NOT NULL | `CREATED` → `IN_PROGRESS` → `COMPLETED` (or `FAILED` / `MANUAL_INTERVENTION_REQUIRED`). `COMPLETED` means business processing produced a recommendation; delivery state lives on `case_report` and `edw_staging` |
+| `applicant_data` | JSONB NOT NULL | Snapshot from the inbound event — authoritative for this case. Includes the `employer_snapshot` sub-object (Section 5.1) when the product handler needs employer context |
+| `status` | string NOT NULL | `CREATED` → `IN_PROGRESS` → `COMPLETED` (or `FAILED` / `MANUAL_INTERVENTION_REQUIRED` / `SUPERSEDED`). `COMPLETED` means business processing produced a recommendation; delivery state lives on `case_report` and `edw_staging`. `SUPERSEDED` is set on the prior case row when a new event arrives with the same `application_id` — see Section 11.2 |
 | `recommendation` | string | `NO_ISSUES`, `HOLD`, `DECLINE` — set after handler completes |
 | `recommendation_rationale` | text | Free-form rationale string emitted alongside the recommendation |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
@@ -483,7 +483,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `dms_document_id` | string NOT NULL | Source identifier in DMS |
 | `document_type` | string | Resolved from DMS metadata once the fetch succeeds |
 | `document_name` | string | Filename as reported by DMS |
-| `status` | string NOT NULL | `PENDING` → `FETCHED` → `VERIFIED` / `TYPE_MISMATCH` / `VERIFICATION_FAILED` → `EXTRACTED` / `EXTRACTION_FAILED` → `VALIDATION_COMPLETED` |
+| `status` | string NOT NULL | `PENDING` → `FETCHED` → `VERIFIED` / `TYPE_MISMATCH` / `VERIFICATION_FAILED` → `EXTRACTION_COMPLETED` / `EXTRACTION_FAILED` → `VALIDATION_COMPLETED` |
 | `verification_result` | string | `MATCH`, `MISMATCH` |
 | `verification_confidence` | float | AI confidence on the type verification call |
 | `fetched_at` | timestamptz | |
@@ -516,10 +516,12 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `case_id` | UUID NOT NULL FK → `application_case` | |
 | `rule_code` | string NOT NULL | Identifies the business rule (e.g. `SALARY_EMPLOYER_MATCH`) |
 | `outcome` | string NOT NULL | `PASS`, `HARD_BREACH`, `SOFT_MISMATCH`, `LOW_CONFIDENCE`, `MANUAL_REVIEW_REQUIRED` |
-| `description` | text NOT NULL | Human-readable explanation of the outcome (rendered in the report) |
-| `field_name` | string | Field the rule operated on, when applicable |
-| `extracted_value` | text | Value pulled from the document |
-| `expected_value` | text | Value the rule expected (e.g. CRM record) |
+| `input_data` | JSONB NOT NULL | Full input data the rule consumed — mirrors `ValidationResult.input_data` verbatim; preserved for audit and replay |
+| `details` | JSONB NOT NULL | Full rule-specific output — mirrors `ValidationResult.details` verbatim; preserved for audit and report rendering |
+| `description` | text NOT NULL | Human-readable explanation of the outcome (rendered in the report) — promoted projection from `details` for display |
+| `field_name` | string | Field the rule operated on, when applicable — promoted projection from `details` for indexed search |
+| `extracted_value` | text | Value pulled from the document — promoted projection from `input_data` for indexed search |
+| `expected_value` | text | Value the rule expected (e.g. CRM record) — promoted projection from `input_data` for indexed search |
 | `confidence` | float | AI confidence, if applicable |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
 | `rule_version` | string | Identifier of the handler rule logic that produced this row (when the rule itself is versioned). Nullable |
@@ -696,25 +698,26 @@ This guarantees the BR-30 explainability PDF and the Workbench's checks table ca
 
 #### Detailed Sequence
 
+In the diagram below, `SRC` represents the source system — both as the input-event publisher (top of the diagram) and as the recipient of the completion notification (bottom). How the inbound event reaches us, and how the completion notification is delivered, are described in **Section 13**.
+
 ```mermaid
 sequenceDiagram
     autonumber
-    actor CRM as Siebel CRM
-    participant KAFKA as Kafka Input Topic
+    participant SRC as Source System
     participant AP as Application Processor
     participant PH as Product Handler
     participant ODB as Postgres (Runtime DB)
-    participant EDW as EDW (Enterprise Data Warehouse)
-    participant DMS as DMS
     participant AI as AI Service
     participant RG as Report Generator
     participant OBS as Observability and Audit
+    participant DMS as DMS
+    participant EDW as EDW (Enterprise Data Warehouse)
 
-    Note over CRM,AP: Publication transport is either a Kafka publish (shown) or a REST API call to our inbound endpoint — see Section 5.
-    CRM->>KAFKA: Publish event {event_id, application_id, product_type, branch_name, validator_id, supervisor_id, document_ids, applicant_data}
-    KAFKA-->>AP: Deliver event
+    Note over SRC,AP: Inbound event via Kafka or REST. See Section 13.
+    SRC->>AP: Inbound event {event_id, application_id, product_type, branch_name, validator_id, supervisor_id, document_ids, applicant_data}
     AP->>ODB: Deduplicate on event_id — skip if seen before
-    AP->>ODB: Persist inbound_application_event and create application_case
+    AP->>ODB: Persist inbound_application_event (status = RECEIVED) and create application_case (status = CREATED)
+    AP->>ODB: Update inbound_application_event.status = PROCESSING
     AP->>OBS: Emit processing-start trace and metrics
     AP->>PH: handle_application(application_id)
 
@@ -722,7 +725,7 @@ sequenceDiagram
     ODB-->>PH: Return case context
     PH->>PH: Check all required document types are present — fail case if any are missing
 
-    loop For each required documentId
+    loop For each required documentId (concurrent)
         PH->>DMS: Fetch document and metadata by documentId
         DMS-->>PH: Return document reference, file metadata, resolved DocumentType
         PH->>ODB: Insert case_document row and dms_artifact (INBOUND)
@@ -746,18 +749,19 @@ sequenceDiagram
             else Extraction completed
                 PH->>ODB: Append stage_output_version (is_valid=true)
                 PH->>ODB: Update case_document status = EXTRACTION_COMPLETED
-
-                PH->>PH: Apply product business rules to extracted data + applicant_data
-                PH->>ODB: Insert validation_result rows (one per rule executed)
-                PH->>ODB: Update case_document status = VALIDATION_COMPLETED
             end
         end
     end
 
+    Note over PH: All required documents extracted — validation begins
+    PH->>PH: Apply product business rules across all document results and applicant_data
+    PH->>ODB: Insert validation_result rows (one per rule executed)
+    PH->>ODB: Update all case_document statuses = VALIDATION_COMPLETED
+
     PH->>ODB: Insert case_result (recommendation, manual_review_required, completed_at)
     PH-->>AP: Return CaseResult {validations, recommendation, manual_review_required}
 
-    AP->>ODB: Update application_case status and recommendation
+    AP->>ODB: Update application_case status = COMPLETED and recommendation
     AP->>RG: generate(application_id, case_result)
 
     RG->>ODB: Load case context, validations, and result
@@ -781,16 +785,18 @@ sequenceDiagram
     AP->>EDW: Write settled output from edw_staging (single operation)
     EDW-->>AP: Confirm write
     AP->>ODB: Mark edw_staging.export_status = EXPORTED
+    AP->>ODB: Set application_case.completed_at = now() (both delivery sides confirmed)
+    AP->>ODB: Update inbound_application_event.status = COMPLETED
 
     AP->>ODB: Write audit_event (CASE_COMPLETED)
     AP->>OBS: Emit processing-completed metric and trace
 
-    Note over AP,CRM: Source-system completion notification — channels, payload, and integration patterns are defined in Section 13 (especially 13.6).
+    Note over AP,SRC: Source-system completion notification. See Section 13.6 for channels, payload, and integration patterns.
     AP->>ODB: Persist pending notification in transactional outbox
-    AP->>CRM: Deliver completion notification (Kafka outbound topic / REST callback / EDW polling — see Section 13.6)
+    AP->>SRC: Deliver completion notification (Kafka outbound topic / REST callback / EDW polling — see Section 13.6)
 ```
 
-> Input ingestion (single-source push, multi-source push, or pull-on-demand) and the outbound completion notification are described in detail in **Section 13 — Source System Integration Patterns**. The diagram above shows the MVP path (Pattern A push from CRM + outbound notification); the alternative input patterns plug in front of `KAFKA → AP` without changing any of the steps below.
+> Input ingestion (single-source push, push from one of multiple sources, or pull-on-demand) and the outbound completion notification are described in detail in **Section 13 — Source System Integration Patterns**. Whichever pattern is chosen, it plugs in *before* the `SRC → AP` arrow above without changing any of the steps below.
 
 ---
 
@@ -808,7 +814,7 @@ These targets drive the horizontal scaling model in Section 10.1 and inform the 
 
 #### 10.1 Horizontal Scaling
 
-A **single Kafka listener** consumes all incoming events and forwards them to an internal **load balancer**, which distributes work across a pool of Application Processor workers. Each worker handles one case at a time; adding workers increases throughput linearly. Postgres handles concurrent writes safely via row-level locking and idempotency checks on `application_id`. The database connection pool size must be configured per worker to avoid exhausting Postgres connections as the pool grows.
+Inbound events arrive on two paths — a **single Kafka listener** for Kafka publishes and a **REST inbound endpoint** for API pushes — both feeding the same internal **load balancer**, which distributes work across a pool of Application Processor workers. Each worker handles one case at a time; adding workers increases throughput linearly. Postgres handles concurrent writes safely via row-level locking and idempotency checks on `application_id`. The database connection pool size must be configured per worker to avoid exhausting Postgres connections as the pool grows.
 
 AI Service follows the same pattern: all AI calls go through a **single AI Service load balancer** that distributes requests across AI Service instances. The AI client URL points to the load balancer — no application code changes when capacity scales. Monitor AI Service request queue depth and per-call latency as the primary scaling signals.
 
@@ -870,7 +876,7 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 **AI Service.** Service error or timeout: exponential backoff retry. Pydantic schema mismatch on extraction response: raw response and validation error persisted, stage marked retryable. If all retries fail: `dead_letter_event`, manual intervention flagged.
 
-**Kafka.** Broker unavailable: consumer group pauses, events remain durable in the topic, processing resumes automatically on reconnection. Invalid event (missing fields, unrecognised `productType`, unsupported schema version): rejected immediately at consumption, raw payload written to `dead_letter_event`, no case created. Duplicate event (`event_id` already in `inbound_application_event`): dropped before any processing begins.
+**Inbound transport (Kafka / REST).** *Kafka broker unavailable:* consumer group pauses, events remain durable in the topic, processing resumes automatically on reconnection. *REST inbound endpoint unavailable:* the source system gets a connection-refused / 5xx response and is responsible for retrying — there is no durable buffer on the REST path, so a brief outage on this side surfaces as a producer-side problem. Sources that need durability should use the Kafka path. *Invalid event* (missing fields, unrecognised `productType`, unsupported schema version): rejected immediately at consumption, raw payload written to `dead_letter_event`, no case created. *Duplicate event* (`event_id` already in `inbound_application_event`): dropped before any processing begins.
 
 **EDW.** Write failure: `edw_staging` row remains intact, retried independently without re-running the pipeline. Schema rejection: `edw_staging` marked `EXPORT_FAILED`, surfaced via observability, manual correction required before retry. The EDW team must confirm idempotency guarantees and error response format.
 
@@ -890,11 +896,11 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 **Worker crash mid-job.** Job remains `IN_PROGRESS` in `processing_job`. A watchdog timeout detects the stalled job, marks it `FAILED`, and re-queues it. Because every stage is idempotent, the re-queued job checks whether output was already written before doing any work — no double-processing.
 
-**Unhandled exception in product handler.** Caught at the Application Processor boundary. Job marked failed; full stack trace written to `dead_letter_event.payload_json` for diagnosis and replay.
+**Unhandled exception in product handler.** Caught at the Application Processor boundary. Job marked failed; full stack trace written to `dead_letter_event.stack_trace` and the raw event payload to `dead_letter_event.raw_payload` for diagnosis and replay.
 
 **Max retries exceeded.** Job moved to `dead_letter_event` with reason code and last error details. Case flagged for manual intervention. Alert raised. Dead letter events are not retried automatically — manual investigation required before replay.
 
-**Missing required documents.** Handler fails the case at the completeness check, persists the list of missing document types, and does not proceed. Case remains in `FAILED` status until missing documents are provided and the case is replayed.
+**Missing required documents.** Handler fails the case at the completeness check, persists the list of missing document types, and does not proceed. Case moves to `MANUAL_INTERVENTION_REQUIRED` status; `application_case.error_detail` records which document types were absent. The case stays in this state until the missing documents are provided and the case is replayed.
 
 **Partial document success.** Completed extractions and validations are persisted. Failed documents remain in a retryable state. Case stays open until all required documents are resolved.
 
@@ -963,7 +969,7 @@ flowchart LR
     AP --> PH --> RG --> OUT
 ```
 
-The shaded **Source Adapter Layer** is the only thing that changes between integration patterns. Whether it consumes from Kafka, accepts a REST push, calls outbound APIs, or merges multiple sources, the contract it produces for the Application Processor is identical: an `InboundApplicationEvent` with the schema in Section 5. **Transport (Kafka vs REST) is orthogonal** to the patterns below — every pattern can be implemented over either, and the adapter normalises both into the same internal event.
+The shaded **Source Adapter Layer** is the only thing that changes between integration patterns. Whether it consumes from Kafka, accepts a REST push, or calls outbound APIs, the contract it produces for the Application Processor is identical: an `InboundApplicationEvent` with the schema in Section 5. **Transport (Kafka vs REST) is orthogonal** to the patterns below — every pattern can be implemented over either, and the adapter normalises both into the same internal event.
 
 ---
 
@@ -975,12 +981,12 @@ The current MVP. Siebel CRM is the orchestrator: it pre-fetches every field need
 sequenceDiagram
     autonumber
     participant CRM as Siebel CRM
-    participant T24 as T24 (CRM-side fetch)
+    participant T24API as T24 REST API
     participant ADP as Source Adapter
     participant AP as Application Processor
 
-    CRM->>T24: Pre-fetch account / banking data
-    T24-->>CRM: Return T24 fields
+    CRM->>T24API: GET /accounts?application_id={application_id}
+    T24API-->>CRM: Return T24 fields
     CRM->>CRM: Assemble applicant_data (incl. T24 + employer_snapshot)
     CRM->>ADP: Publish event via Kafka topic (or POST /inbound)
     ADP->>AP: Hand off InboundApplicationEvent (no transformation)
@@ -1031,7 +1037,7 @@ sequenceDiagram
 
 #### 13.4 Pattern C — Pull on demand
 
-The source publishes only `application_id` (plus minimum routing fields: `event_id`, `product_type`, `validator_id`, `supervisor_id`). The Source Adapter then calls CRM and T24 APIs synchronously to fetch the remaining `applicant_data`.
+The source publishes only a minimal trigger: `event_id`, `application_id`, `product_type`, and `validator_id`. The Source Adapter then calls CRM and T24 APIs synchronously to fetch the remaining `applicant_data` (including `supervisor_id`, `branch_name`, and the `employer_snapshot`).
 
 ```mermaid
 sequenceDiagram
@@ -1042,7 +1048,7 @@ sequenceDiagram
     participant T24API as T24 REST API
     participant AP as Application Processor
 
-    CRM->>ADP: Trigger {event_id, application_id, product_type}
+    CRM->>ADP: Trigger {event_id, application_id, product_type, validator_id}
     par Concurrent fetch
         ADP->>CRMAPI: GET /applicants/{application_id}
         CRMAPI-->>ADP: Return CRM fields (incl. employer_snapshot)
@@ -1070,11 +1076,11 @@ sequenceDiagram
 
 | Concern | Pattern A (push, single) | Pattern B (push, multi) | Pattern C (pull) |
 |---|---|---|---|
-| Effort on this side | Lowest | Medium (aggregator + state) | Medium (API clients + retries) |
-| Effort on source systems | Highest (CRM does all the gathering) | Medium (each source publishes its own slice) | Lowest (CRM fires a trigger only) |
-| Data freshness | Snapshot at publish | Snapshot at last-arriving publish | Real-time at processing |
-| Failure blast radius | Confined to CRM publish | Confined per-source slice | Either source outage stalls the case |
-| Best fit | MVP, single owner | Several systems own different fields and publish independently | Sources can't or won't pre-assemble; freshness matters |
+| Effort on this side | Lowest | Low–Medium (per-source format adapters) | Medium (API clients + retries) |
+| Effort on source systems | Highest (CRM does all the gathering) | Each source publishes complete events for its own cases | Lowest (CRM fires a trigger only) |
+| Data freshness | Snapshot at publish | Snapshot at publish (per source) | Real-time at processing |
+| Failure blast radius | Confined to CRM publish | Confined to the originating source — others continue | Either source outage stalls the case |
+| Best fit | MVP, single owner | Different sources own different case populations and each publishes its own | Sources can't or won't pre-assemble; freshness matters |
 
 **These patterns are not mutually exclusive.** The Source Adapter can support more than one in parallel — for example, accept Pattern A from CRM today and add Pattern C for new sources later — because the contract it emits to the Application Processor is identical in every case.
 
