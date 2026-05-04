@@ -107,7 +107,12 @@ Every decision above relies on assumptions that are not derivable from the code 
 
 ### 5. Input Event Contract
 
-The Kafka message that starts processing must carry:
+The trigger event that starts processing can arrive over either of two transports — both produce the same internal `InboundApplicationEvent` and follow the same downstream pipeline (see Section 13.1 for the Source Adapter that normalises them):
+
+- **Kafka publish** — the source system publishes to the configured input topic. Durable, replayable, asynchronous.
+- **REST API call to our system** — the source system POSTs the same payload to an inbound endpoint we expose. Synchronous, simpler for systems that don't run a Kafka producer.
+
+Whichever transport is used, the payload must carry the fields below:
 
 | Field | Type | Description |
 |---|---|---|
@@ -705,6 +710,7 @@ sequenceDiagram
     participant RG as Report Generator
     participant OBS as Observability and Audit
 
+    Note over CRM,AP: Publication transport is either a Kafka publish (shown) or a REST API call to our inbound endpoint — see Section 5.
     CRM->>KAFKA: Publish event {event_id, application_id, product_type, branch_name, validator_id, supervisor_id, document_ids, applicant_data}
     KAFKA-->>AP: Deliver event
     AP->>ODB: Deduplicate on event_id — skip if seen before
@@ -778,7 +784,13 @@ sequenceDiagram
 
     AP->>ODB: Write audit_event (CASE_COMPLETED)
     AP->>OBS: Emit processing-completed metric and trace
+
+    Note over AP,CRM: Source-system completion notification — channels, payload, and integration patterns are defined in Section 13 (especially 13.6).
+    AP->>ODB: Persist pending notification in transactional outbox
+    AP->>CRM: Deliver completion notification (Kafka outbound topic / REST callback / EDW polling — see Section 13.6)
 ```
+
+> Input ingestion (single-source push, multi-source push, or pull-on-demand) and the outbound completion notification are described in detail in **Section 13 — Source System Integration Patterns**. The diagram above shows the MVP path (Pattern A push from CRM + outbound notification); the alternative input patterns plug in front of `KAFKA → AP` without changing any of the steps below.
 
 ---
 
@@ -892,188 +904,212 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 ---
 
-### 12. Validator Workbench — Output Delivery Options
+### 12. Output Delivery Options
 
-Once the pipeline completes, the Validator and Supervisor need to access the case results and the PDF report. There are two architectural options for how this is delivered. **Both options are viable given our data architecture: the pipeline already writes a complete denormalised snapshot to `edw_staging` (mirrored to EDW) and uploads the PDF to DMS, so the data required by either option is always available at completion.** Both are described below with their tradeoffs.
+Once the pipeline completes, the Validator and Supervisor need to access the case results and the PDF report. Two delivery options are viable given the existing data architecture — the pipeline already writes a complete denormalised snapshot to `edw_staging` (mirrored to EDW) and uploads the PDF to DMS, so the data required by either option is always available at completion time. The choice is operational, not architectural.
 
----
+#### Option A — EDW + DMS only (CRM-native, no internal UI)
 
-#### Option A — EDW-only delivery (CRM-native, no internal UI)
+The platform's only outputs are the PDF in DMS and the structured case payload in EDW. Siebel CRM reads both natively: the PDF appears in the CRM case viewer, and the structured data is surfaced via CRM's existing EDW integration. Validators and Supervisors stay entirely inside their existing CRM workflow — no new tool to learn, no separate authentication layer.
 
-In this option, the platform's only outputs are the PDF uploaded to DMS and the structured case data written to EDW. Siebel CRM reads both natively: the PDF appears in the document viewer inside the CRM case record, and the structured data is surfaced through CRM's existing EDW integration.
-
-**How it works:**
-- The pipeline completes and writes the PDF to DMS and the full case payload to EDW.
-- The Validator opens the application in Siebel CRM and sees the PDF report as an attached document — no additional system is needed.
-- The Supervisor monitors cases through CRM's existing team views, filtered by their subordinates.
-- No internal UI is built or maintained by this team.
-
-**Advantages:**
-- Zero UI development effort. The team owns only the processing pipeline.
-- Validators and Supervisors work entirely within their existing CRM workflow — no new tool to learn.
-- No additional authentication layer, no frontend infrastructure to operate.
-
-**Disadvantages:**
-- The display of case data (validations, recommendation, document breakdown) is controlled by the CRM team, not this team. Layout and detail level depend on what CRM can render from EDW.
-- Real-time pipeline status (IN_PROGRESS, FAILED, retrying) is not visible to Validators unless CRM exposes EDW status fields — which may not be the case.
-- No way to surface MANUAL_INTERVENTION_REQUIRED cases proactively; Validators must poll CRM.
-- Any change to what Validators see requires CRM-side work, not this team's work.
-
-**Assumption for this option:** The CRM team has an active EDW integration that can surface the structured case payload fields in the CRM UI, and they are willing to build or extend it for this use case. This must be confirmed before choosing Option A.
-
----
+- **Pros:** zero UI development on this side; reviewers stay in CRM.
+- **Cons:** the layout and detail of validations, recommendation, and document breakdown is controlled by the CRM team; real-time pipeline status (IN_PROGRESS, FAILED, retrying) is invisible unless CRM exposes EDW status fields; any change to what reviewers see depends on CRM team capacity.
+- **Assumption:** the CRM team has an active EDW integration that can surface the structured payload fields and is willing to extend it for this use case. Must be confirmed before choosing Option A.
 
 #### Option B — Internal Validator Workbench (custom UI owned by this team)
 
-In this option, this team builds and operates a dedicated internal web application — the **Validator Workbench** — that Validators and Supervisors use instead of (or alongside) Siebel CRM for reviewing AI-processed cases. The workbench reads directly from Postgres and streams the PDF from DMS.
+This team builds and operates a dedicated read-only internal web application. Validators see only their own cases; Supervisors see all cases under their team. The Workbench reads from a Postgres read replica and streams the PDF from DMS. No case actions (approve / reject / override) are taken in the Workbench — those remain in Siebel CRM.
 
-**How it works:**
-- The pipeline completes and writes results to Postgres (as it always does). The PDF is in DMS.
-- The Validator logs into the Workbench. At login, the system fetches all cases assigned to them and displays them as a dashboard.
-- The Supervisor logs in and sees all cases for every Validator under them.
-- The Validator selects a case to open the detail view, reviews all information, and downloads the PDF report.
-- No case actions (approve, reject, override) are taken in the Workbench — those remain in Siebel CRM. The Workbench is read-only.
+- **Pros:** full control over the reviewer experience — real-time pipeline status, validation breakdowns with confidence scores, manual-review flags, technical-exceptions panel; MANUAL_INTERVENTION_REQUIRED cases can be pinned as priority banners; the UI evolves independently of CRM team capacity.
+- **Cons:** frontend development, hosting, and ongoing maintenance; adds an authentication / access-control layer that must integrate with the bank's identity system; reviewers context-switch between two systems (Workbench to review, CRM to act).
+- **Assumption:** the bank's identity system exposes an integration point (e.g. OAuth2 / SAML) that returns each user's `validator_id` / `supervisor_id`. Must be confirmed with the infrastructure team.
 
-**Advantages:**
-- Full control over what Validators see: real-time pipeline status, validation breakdowns, confidence scores, manual-review flags.
-- Can surface MANUAL_INTERVENTION_REQUIRED cases as priority banners without waiting for CRM.
-- Independent of CRM team capacity — this team owns the full experience.
-- Can evolve the UI (add filters, bulk views, audit trails) without CRM involvement.
+#### 12.1 Choosing
 
-**Disadvantages:**
-- Requires frontend development, hosting, and ongoing maintenance.
-- Adds an authentication and access control layer that must integrate with the bank's identity system.
-- Validators must context-switch between two systems (Workbench to review, CRM to act).
-
-**Assumption for this option:** The bank's identity system exposes an integration point (e.g. OAuth2 / SAML) that allows the Workbench to authenticate users and retrieve their `validator_id` and `supervisor_id`. This must be confirmed with the infrastructure team.
+Both options use the same underlying outputs, so the choice is purely operational: whether the Validator experience is owned by the CRM team (A) or this team (B). Option A is lower-effort but depends on the CRM team's ability to surface EDW data with sufficient detail; Option B gives this team full control at the cost of building and operating a web application. If the CRM team cannot expose validation detail and real-time pipeline status from EDW, Option B is the only path to a complete reviewer experience.
 
 ---
 
-#### 12.1 Recommendation
+### 13. Source System Integration Patterns
 
-Because the pipeline always produces both outputs — the PDF in DMS and the full structured payload in `edw_staging` / EDW — neither option requires a data architecture change. The choice is purely operational: whether the Validator experience is owned by the CRM team (Option A) or this team (Option B). Option A is lower-effort but depends on the CRM team's willingness and ability to surface EDW data in their UI. Option B gives this team full control and a richer Validator experience, at the cost of building and operating a web application. If the CRM team cannot expose validation detail and real-time status from EDW, Option B is the only path to a complete Validator experience.
+> Sections 5–11 describe the system as if a single source (Siebel CRM) publishes a single Kafka event carrying everything we need (`applicant_data` + `document_ids`). That contract is the easiest to operate, but in practice applicant data is owned across at least two systems — **Siebel CRM** (customer profile, employer, declared salary) and **T24** (core banking / account data). This section describes how the input path can vary without changing the core processing logic, and how the platform reports completion back to whichever system originated the request.
 
----
-
-#### 12.2 Workbench design (Option B only)
-
-The following sections describe the Workbench in detail. They apply only if Option B is chosen.
+**Core invariant.** The Application Processor operates on a fully-formed `applicant_data` object plus a list of `document_ids`. Where those values come from is an integration concern, not a pipeline concern. **Sections 5–11 still apply unchanged once the input has been assembled** — only the component sitting *in front of* the Application Processor changes between patterns.
 
 ---
 
-#### 12.2.1 Access model
+#### 13.1 Where the variation sits
 
-Every Workbench session is scoped to the authenticated user's role:
+```mermaid
+flowchart LR
+    subgraph SOURCES[Source Systems]
+        CRM[Siebel CRM]
+        T24[T24 Core Banking]
+    end
 
-- A **Validator** sees only cases where `application_case.validator_id` matches their identity system user ID.
-- A **Supervisor** sees all cases where `application_case.supervisor_id` matches their user ID — covering every Validator on their team.
-- The backend resolves the user's role and ID from the authenticated session token before executing any query. No user can query another user's cases by manipulating the request.
+    subgraph ADAPTER[Source Adapter Layer]
+        IN[Input Assembler]
+    end
 
----
+    subgraph CORE[Core Pipeline - unchanged]
+        AP[Application Processor]
+        PH[Product Handler]
+        RG[Report Generator]
+        OUT[(EDW + DMS)]
+    end
 
-#### 12.2.2 Case list view (dashboard)
+    SOURCES --> IN
+    IN -->|"InboundApplicationEvent (Section 5 schema)"| AP
+    AP --> PH --> RG --> OUT
+```
 
-At each login, the Workbench loads all cases in scope for the authenticated user. Each case appears as a card:
-
-| Field | Source |
-|---|---|
-| Application ID | `application_case.application_id` |
-| Applicant name | `application_case.applicant_data.name` |
-| Product type | `application_case.product_type` |
-| Branch name | `application_case.branch_name` |
-| Submission date | `application_case.created_at` |
-| Status banner | `application_case.status` — displayed as a coloured badge: IN_PROGRESS (blue), COMPLETED (green), FAILED (red), MANUAL_INTERVENTION_REQUIRED (amber) |
-| Recommendation badge | `case_result.recommendation` — shown only when status = COMPLETED: NO_ISSUES (green), HOLD (amber), DECLINE (red) |
-
-Cards are sorted by submission date descending. The Validator can filter by status or recommendation client-side. MANUAL_INTERVENTION_REQUIRED cases are pinned to the top of the list regardless of date.
-
----
-
-#### 12.2.3 Case detail view
-
-Selecting a card opens the detail view. It shows the full picture of the case in one screen:
-
-**Applicant summary** — all fields from `applicant_data` (name, ID number, date of birth, employer, declared salary, branch).
-
-**Document panel** — one row per document in `case_document`:
-- Document type
-- Verification result (MATCH / MISMATCH) and confidence score
-- Extraction status
-- Per-field extracted values with their confidence scores (from `stage_output_version.extracted_data`)
-
-**Employer rules panel** — when `applicant_data.employer_snapshot` is present, shows employer name (normalised), employer class, and the employer ID from the rules source.
-
-**Document completeness panel** — required documents (resolved by the handler from `applicant_data`), received documents, missing documents (BR-12).
-
-**Validation panel** — one row per rule in `validation_result`, grouped by outcome category. Each row carries a per-check **evidence drill-down** (BR-31): the field name, extracted value, expected value (from CRM / employer-rule snapshot / structured source), confidence score, and a deep link to the source document page so the reviewer can challenge any check directly.
-- HARD_BREACH entries shown first with full details and failing condition
-- SOFT_MISMATCH entries showing expected vs. actual values
-- LOW_CONFIDENCE entries showing the field, extracted value, and confidence score
-- MANUAL_REVIEW_REQUIRED entries listed with the reason for manual review
-
-**Manual checks panel** (BR-30 / BR-33) — aggregates everything that requires a human verdict in one place:
-- Rule-driven items: any `validation_result` row with `manual_review_required = true` or `outcome = MANUAL_REVIEW_REQUIRED`, deduplicated by `rule_code`.
-- One **stamp / signature visual review** entry per source document. The system renders the document image and the reference record but never produces an automated verdict for these checks in the MVP. The reviewer ticks them off manually.
-
-**Technical Exceptions panel** (BR-36 / BR-37) — collects every `*.error_detail` and `edw_staging.export_error` for the case. Rendered with a visually distinct palette (neutral grey, dashed border) so an integration or extraction failure is never confused with a business-rule outcome. A non-empty panel does not change the recommendation; it tells the reviewer something downstream is unresolved.
-
-**Recommendation block** — the system recommendation (NO_ISSUES / HOLD / DECLINE) displayed prominently, with a manual review flag if `case_result.manual_review_required = true`.
-
-**Report download** — a button that fetches the PDF from DMS using `case_report.pdf_dms_document_id` and streams it to the browser. The button is disabled if `pdf_dms_document_id` is null (report not yet available or upload failed).
-
-**Audit timeline** — a chronological trail of key events from `audit_event`: event received, case created, each document fetched and verified, extraction completed, validations run, report generated, report uploaded, EDW exported.
+The shaded **Source Adapter Layer** is the only thing that changes between integration patterns. Whether it consumes from Kafka, accepts a REST push, calls outbound APIs, or merges multiple sources, the contract it produces for the Application Processor is identical: an `InboundApplicationEvent` with the schema in Section 5. **Transport (Kafka vs REST) is orthogonal** to the patterns below — every pattern can be implemented over either, and the adapter normalises both into the same internal event.
 
 ---
 
-#### 12.2.4 Workbench sequence
+#### 13.2 Pattern A — Push from a single source (MVP)
+
+The current MVP. Siebel CRM is the orchestrator: it pre-fetches every field needed (including T24 account data and any external references) and publishes a single self-contained event.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor V as Validator / Supervisor
-    participant WB as Workbench (Frontend)
-    participant API as Workbench API (Backend)
-    participant AUTH as Identity System
-    participant ODB as Postgres (Read Replica)
-    participant DMS as DMS
+    participant CRM as Siebel CRM
+    participant T24 as T24 (CRM-side fetch)
+    participant ADP as Source Adapter
+    participant AP as Application Processor
 
-    V->>WB: Open Workbench and log in
-    WB->>AUTH: Authenticate user — resolve user_id and role
-    AUTH-->>WB: Return session token with user_id and role
-
-    WB->>API: GET /api/v1/cases (with session token)
-    API->>AUTH: Validate token and extract user_id and role
-    AUTH-->>API: Confirmed user_id and role
-    API->>ODB: Query application_case scoped to user_id and role
-    ODB-->>API: Return case list with status and recommendation
-    API-->>WB: Return case cards
-    WB-->>V: Render dashboard — cases with status banners and recommendation badges
-
-    V->>WB: Select a case
-    WB->>API: GET /api/v1/cases/{application_id}
-    API->>ODB: Query case detail (documents, extractions, validations, result, report metadata, audit trail)
-    ODB-->>API: Return full case data
-    API-->>WB: Return case detail payload
-    WB-->>V: Render case detail (applicant data, document panel, validation panel, recommendation, audit timeline)
-
-    V->>WB: Click Download Report
-    WB->>API: GET /api/v1/cases/{application_id}/report
-    API->>ODB: Fetch pdf_dms_document_id from case_report
-    ODB-->>API: Return pdf_dms_document_id
-    API->>DMS: Fetch PDF by document_id
-    DMS-->>API: Return PDF binary
-    API-->>WB: Stream PDF to browser
-    WB-->>V: PDF opens in browser or downloads
+    CRM->>T24: Pre-fetch account / banking data
+    T24-->>CRM: Return T24 fields
+    CRM->>CRM: Assemble applicant_data (incl. T24 + employer_snapshot)
+    CRM->>ADP: Publish event via Kafka topic (or POST /inbound)
+    ADP->>AP: Hand off InboundApplicationEvent (no transformation)
+    AP->>AP: Proceed with Section 9 sequence (no change)
 ```
+
+| Property | Behaviour |
+|---|---|
+| Input shape | One event per case, fully populated |
+| Coupling | Tight to CRM at publish time; no live dependency at processing time |
+| Failure isolation | CRM outage does not affect in-flight cases — they own a snapshot |
+| Risk | Stale snapshot — if T24 data changes between publish and processing, the event still reflects publish-time values |
 
 ---
 
-#### 12.2.5 Workbench API endpoints
+#### 13.3 Pattern B — Push from one of multiple sources
 
-All endpoints are read-only. No writes are performed by the Workbench backend. Queries run against a Postgres read replica to isolate UI load from the pipeline write path.
+Either source system can publish a complete event for a given case — but only one publishes per case (not both contributing slices). For example, retail-banking-originated cases may come from Siebel CRM while corporate-banking cases come from T24. Each source produces its own event format; the Source Adapter normalises both into the same internal `InboundApplicationEvent` before handing off.
 
-| Endpoint | Description |
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CRM as Siebel CRM
+    participant T24 as T24
+    participant ADP as Source Adapter
+    participant AP as Application Processor
+
+    alt Case originates in CRM
+        CRM->>ADP: Publish full event {application_id, applicant_data, document_ids} (CRM format)
+        ADP->>ADP: Translate CRM format to InboundApplicationEvent
+    else Case originates in T24
+        T24->>ADP: Publish full event {application_id, applicant_data, document_ids} (T24 format)
+        ADP->>ADP: Translate T24 format to InboundApplicationEvent
+    end
+    ADP->>AP: Hand off InboundApplicationEvent (same internal contract)
+```
+
+| Property | Behaviour |
 |---|---|
-| `GET /api/v1/cases` | Returns all cases in scope for the authenticated user, with status and recommendation. Supports query params: `status`, `recommendation`, `product_type`. |
-| `GET /api/v1/cases/{application_id}` | Returns full case detail: applicant data, all documents with verification and extraction results, all validation results grouped by outcome, recommendation, report metadata, audit timeline. |
-| `GET /api/v1/cases/{application_id}/report` | Fetches the PDF from DMS by `pdf_dms_document_id` and streams it to the caller. Returns 404 if the report is not yet available. |
+| Input shape | One self-contained event per case, from whichever source owns it |
+| Coupling | Source-specific format adapters, but no cross-source coordination |
+| Failure isolation | Producers are independent — a CRM outage does not affect cases originating in T24, and vice versa |
+| Risk | Source-format drift — each producer's schema must be versioned and contract-tested independently |
+
+> **To be confirmed with CRM, T24, and integration teams:** the topic / endpoint per source, the per-source event schema, that `application_id` is globally unique across producers, and version control for each source's contract.
+
+---
+
+#### 13.4 Pattern C — Pull on demand
+
+The source publishes only `application_id` (plus minimum routing fields: `event_id`, `product_type`, `validator_id`, `supervisor_id`). The Source Adapter then calls CRM and T24 APIs synchronously to fetch the remaining `applicant_data`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CRM as Siebel CRM
+    participant ADP as Source Adapter
+    participant CRMAPI as CRM REST API
+    participant T24API as T24 REST API
+    participant AP as Application Processor
+
+    CRM->>ADP: Trigger {event_id, application_id, product_type}
+    par Concurrent fetch
+        ADP->>CRMAPI: GET /applicants/{application_id}
+        CRMAPI-->>ADP: Return CRM fields (incl. employer_snapshot)
+    and
+        ADP->>T24API: GET /accounts?application_id={application_id}
+        T24API-->>ADP: Return T24 fields
+    end
+    ADP->>ADP: Assemble applicant_data
+    ADP->>AP: Hand off InboundApplicationEvent (full payload)
+```
+
+| Property | Behaviour |
+|---|---|
+| Input shape | Tiny trigger event; payload assembled on our side |
+| Coupling | Live dependency on CRM and T24 APIs at processing time |
+| Freshness | Always reads the latest values from each source |
+| Risk | API outage at either source delays or fails the case; SLA must absorb the extra round trips |
+| Required contracts | Stable read APIs at each source with defined SLAs, idempotent reads, and clear error semantics |
+
+> **To be confirmed with CRM and T24 teams:** read-API availability, SLA, idempotency of repeated reads, authentication model (mTLS / OAuth client credentials / network ACL), and behaviour when the application is not yet visible to the source (race between trigger publish and source-side commit).
+
+---
+
+#### 13.5 Choosing a pattern
+
+| Concern | Pattern A (push, single) | Pattern B (push, multi) | Pattern C (pull) |
+|---|---|---|---|
+| Effort on this side | Lowest | Medium (aggregator + state) | Medium (API clients + retries) |
+| Effort on source systems | Highest (CRM does all the gathering) | Medium (each source publishes its own slice) | Lowest (CRM fires a trigger only) |
+| Data freshness | Snapshot at publish | Snapshot at last-arriving publish | Real-time at processing |
+| Failure blast radius | Confined to CRM publish | Confined per-source slice | Either source outage stalls the case |
+| Best fit | MVP, single owner | Several systems own different fields and publish independently | Sources can't or won't pre-assemble; freshness matters |
+
+**These patterns are not mutually exclusive.** The Source Adapter can support more than one in parallel — for example, accept Pattern A from CRM today and add Pattern C for new sources later — because the contract it emits to the Application Processor is identical in every case.
+
+---
+
+#### 13.6 Output — notifying the source system on completion
+
+Once the pipeline finishes (recommendation produced, PDF in DMS, EDW row exported), the originating system needs to know. Three notification channels are supported, again chosen at integration time without affecting the core pipeline.
+
+```mermaid
+flowchart LR
+    AP[Application Processor] -->|"completion event"| OB[(outbound_notification)]
+    OB --> NW[Notification Worker]
+    NW --> N1[Kafka outbound topic]
+    NW --> N2[REST callback]
+    NW --> N3[EDW polling - source-driven]
+    N1 --> SRC[Source System - CRM / T24]
+    N2 --> SRC
+    N3 --> SRC
+```
+
+| Channel | Mechanism | When to use |
+|---|---|---|
+| **Kafka outbound topic** | After `application_case.completed_at` is set, publish to e.g. `credit-applications.completed` | When the source already consumes Kafka and asynchronous push is acceptable |
+| **REST callback** | POST to a per-source `callback_url` with the completion payload; ack-on-2xx | When the source requires synchronous push and exposes an inbound HTTP endpoint |
+| **EDW polling** | Source reads `edw_staging` (or the EDW table) directly on its own schedule | When the source is data-warehouse-driven and no live push is required (today's MVP path for Siebel CRM) |
+
+**Outbound notification payload** — at minimum carries `event_id`, `application_id`, `case_id`, `status`, `recommendation`, `manual_review_required`, the `pdf_dms_document_id` (so the source can link to the report), the `edw_confirmation_id` (so the source can verify the structured payload landed), and `completed_at`. Each source-system owner may request additional fields (e.g. CRM echoing back `validator_id`; T24 mapping to an internal `case_reference`).
+
+**Outbound durability — the transactional-outbox pattern.** The completion notification is persisted in the **same transaction** as `application_case.completed_at`, using a durable outbox in Postgres. A Notification Worker reads pending notifications, attempts delivery, and marks them sent or failed. This decouples outbound delivery from pipeline completion: a source-system outage cannot block a case from being marked `COMPLETED`, and retries can be replayed without re-running the pipeline. Failed notifications follow the same retry / dead-letter pattern as the rest of the system (Section 11). The exact storage shape for the outbox is left to the implementation — what matters at this design level is the same-transaction persistence and the asynchronous worker.
+
+> **To be confirmed with each source-system owner:** preferred channel, payload extensions, authentication for REST callbacks, retry / acknowledgement semantics, and idempotency keys (consumers should treat repeated delivery of the same `event_id` as a no-op).
+
+---
+
+#### 13.7 Why the core pipeline is unchanged
+
+Across all three input patterns and all three output channels, **nothing in Sections 6–11 changes**. The Application Processor still consumes a single `InboundApplicationEvent` with the schema in Section 5; the Product Handler still operates on `applicant_data` and `document_ids`; the EDW write and PDF upload still happen exactly once. The Source Adapter and the Notification Worker are integration components that bracket the pipeline — they do not participate in business decisions. This separation is the reason we can add T24, change the ingestion model, or add a new notification channel without touching the recommendation logic.

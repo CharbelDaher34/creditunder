@@ -1,255 +1,164 @@
 {
   "project": "AI Credit Underwriting Platform — Alinma Bank",
-  "description": "Sequential build plan to recreate the project from scratch. Tasks are ordered by dependency: each phase must be complete before the next begins. Every task lists exactly what to build, where it lives, and how to verify it.",
+  "description": "Build plan organized into two phases: enablers (foundation that every business story depends on) and the Personal Finance business story (the first product end-to-end). All enablers must be complete before the business story begins.",
   "phases": [
     {
       "phase": 1,
-      "name": "Project Bootstrap & Tooling",
+      "name": "Enablers",
+      "description": "Foundational tasks that have no business logic of their own but are prerequisites for any product story. Adding a second product later (Credit Cards, Auto Lease, Real Estate Mortgage) reuses everything in this phase unchanged.",
       "tasks": [
         {
           "id": "1.1",
-          "title": "Create Azure DevOps repo and connect to OpenShift cluster",
-          "details": "Create a new Azure DevOps Git repository for the project. Configure the OpenShift cluster integration: set up a service account with the necessary RBAC, create a pipeline service connection in Azure DevOps pointing to the cluster, and verify the connection with a test pipeline run. Set up branch policies on main (require PR + CI green before merge).",
-          "deliverables": [
-            "Azure DevOps repo",
-            "OpenShift service connection",
-            "branch policies on main"
+          "title": "Azure DevOps repository and OpenShift deployment integration",
+          "description": "Establish the version-controlled home for the project and wire it to the bank's OpenShift deployment target. This is the foundation every other task builds on: without a repository, nothing can be committed; without a cluster connection, nothing can be deployed. Branch protection on main ensures no code reaches production without passing CI and a peer review.",
+          "acceptance_criteria": [
+            "Repository exists in Azure DevOps and is accessible to the team",
+            "CI pipeline can authenticate to OpenShift and deploy a test workload",
+            "Merging to main requires a passing CI build and at least one approved PR review"
           ]
         },
         {
           "id": "1.2",
-          "title": "Project scaffold — dependencies, config loader, env template",
-          "details": "Clone repo locally. Create the directory layout: src/creditunder/, mockups/dms/, mockups/crm/. Add .gitignore (Python, .env, __pycache__, *.pyc). Author pyproject.toml with uv targeting Python 3.14 and these runtime deps: sqlalchemy[asyncio], asyncpg, aiokafka, pydantic, pydantic-settings, pydantic-ai, fastapi, uvicorn, jinja2, weasyprint, structlog, httpx, python-multipart, pyyaml. Run `uv sync` to materialize uv.lock. Author .env.example listing every host-mapped port and external-credential env var: DMS_PORT, CRM_PORT, KAFKA_TOPIC, KAFKA_CONSUMER_GROUP, OPENAI_API_KEY, AI_BASE_URL, AI_API_KEY, AI_MODEL, DMS_BASE_URL, CRM_BASE_URL. (Internal-only vars — DATABASE_URL, KAFKA_BOOTSTRAP_SERVERS — are NOT in .env; they belong in docker-compose env blocks.) Implement src/creditunder/config.py using pydantic-settings to load the env into a typed Settings model.",
-          "deliverables": [
-            "pyproject.toml",
-            "uv.lock",
-            ".env.example",
-            "src/creditunder/config.py",
-            ".gitignore"
+          "title": "Project bootstrap — dependencies, configuration, logging, and local infrastructure",
+          "description": "Set up everything a developer needs to clone the repo and run the platform on their machine. This bundles four concerns that have no value individually but together form the development baseline: a Python project with locked dependencies (so every environment runs identical package versions), a typed configuration loader that reads environment variables and refuses to start if anything required is missing, a structured JSON logger emitting consistent correlation fields on every entry (so logs can be searched and filtered without manual parsing), and a docker-compose stack with Kafka (KRaft mode, no ZooKeeper) and Postgres reachable from inside the Docker network. Internal services are deliberately not exposed to the host, matching the production security posture where Kafka and the database are cluster-internal.",
+          "acceptance_criteria": [
+            "Running the dependency install command produces a reproducible lock file",
+            "A template environment file documents every variable a developer must set",
+            "The application refuses to start with a clear error if a required configuration value is missing",
+            "All log output written to stdout is valid JSON with correlation fields (application_id, component, log level, timestamp) on every entry",
+            "docker-compose brings up Kafka (KRaft) and Postgres in one command, with the application topic auto-created",
+            "Postgres and Kafka are not reachable from the host machine — only from within the Docker network"
           ]
         },
         {
           "id": "1.3",
-          "title": "Configure structlog",
-          "details": "src/creditunder/observability.py: configure structlog to emit JSON to stdout with these standard fields on every entry: application_id, event_id, trace_id, span_id, component, log_level, timestamp, message. Expose `get_logger(component: str)` for callers. No OpenTelemetry wiring at this stage.",
-          "deliverables": [
-            "src/creditunder/observability.py"
+          "title": "Document Management System (DMS) mockup service",
+          "description": "The real DMS is a bank system not available in local development or CI. This mockup provides the same HTTP surface as the real DMS — backed by the local filesystem — so the rest of the platform can be developed and tested without any dependency on bank infrastructure. Two operations are required to support every downstream story: uploading a new document and fetching an existing one by ID. Persistence across container restarts is mandatory; pre-seeded sample documents allow developers to run the full stack and see processing happen immediately, with no manual upload step.",
+          "acceptance_criteria": [
+            "A document can be uploaded and later fetched by the ID returned at upload time",
+            "Documents persist across container restarts",
+            "Sample documents are pre-seeded on first startup so end-to-end runs work without manual setup"
           ]
         },
         {
           "id": "1.4",
-          "title": "Local Kafka broker via docker-compose (no code integration)",
-          "details": "Stand up a Kafka broker in docker-compose so later tasks can integrate against a real broker. Create docker-compose.yml at the repo root with a single `kafka` service using `apache/kafka:3.7.2` in KRaft mode (no ZooKeeper). Configure: KAFKA_NODE_ID=1, KAFKA_PROCESS_ROLES=broker,controller, internal listener `kafka:9092` (Docker network only — NOT exposed to the host), controller listener for KRaft quorum, single-broker quorum voter set. Add a one-shot `kafka-init` service (or compose-managed `command:` on the kafka container) that creates the topic named by KAFKA_TOPIC (default: `credit-applications`) once the broker is healthy. Verify end-to-end without any application code:\n  1. `docker compose up -d kafka` and wait for the broker to report ready in logs.\n  2. From inside the kafka container, run `kafka-topics.sh --bootstrap-server kafka:9092 --list` and confirm `credit-applications` exists.\n  3. `kafka-console-producer.sh --bootstrap-server kafka:9092 --topic credit-applications` — type a test JSON line.\n  4. `kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic credit-applications --from-beginning` — confirm the line is consumed.\n  5. Capture the producer/consumer output as the verification log.\nThis task installs Kafka as project infrastructure ONLY. No Python producer or consumer is written here — the processor (7.3) and CRM mockup (8.2) will integrate later.",
-          "deliverables": [
-            "docker-compose.yml (kafka + kafka-init only — postgres, processor, mockups added in 9.2)",
-            "verification log: round-trip via kafka-console-producer + kafka-console-consumer"
+          "title": "AI service client (OpenAI-compatible)",
+          "description": "The platform calls an AI backend in two distinct contexts: per-document structured extraction (must be deterministic) and per-case narrative generation for the report (slight temperature for natural language). The client abstracts both call patterns behind a single interface, reads its endpoint, key, and model name entirely from environment configuration, and supports both OpenAI and any OpenAI-compatible endpoint — so the bank can switch providers or move to an on-premise model without touching pipeline code. Structured output is enforced via pydantic schemas so the AI cannot return malformed responses that would crash the pipeline downstream.",
+          "acceptance_criteria": [
+            "Document extraction returns a typed result that includes both the verification decision and all extracted fields in a single response",
+            "Narrative generation returns a coherent paragraph suitable for a credit assessment report",
+            "Endpoint, API key, and model name are read entirely from environment configuration — no hard-coded values"
+          ]
+        },
+        {
+          "id": "1.5",
+          "title": "DMS service client",
+          "description": "Every document the platform processes is fetched from and delivered to DMS. This client encapsulates that HTTP interaction — providing fetch and upload operations — so the pipeline never constructs raw HTTP calls. Keeping I/O behind a client interface also makes the pipeline testable: tests can substitute a fake client without spinning up a real DMS.",
+          "acceptance_criteria": [
+            "A document can be fetched by its DMS ID and its binary content returned to the caller",
+            "A generated report can be uploaded and its DMS document ID returned to the caller",
+            "The DMS base URL is read from configuration, with no hard-coded addresses"
+          ]
+        },
+        {
+          "id": "1.6",
+          "title": "Persistence layer — domain enums, database tables, async session, migrations",
+          "description": "Before any business logic or pipeline can be written, the system needs a shared vocabulary (product types, document types, case and document statuses, validation outcomes, recommendations) and the persistence shape that pipeline writes will follow. The enums become the contract between every layer of the system. The tables encode the design's hard requirements: pipeline tables are append-only (rows are never updated after insert, so the audit trail is tamper-evident); the audit event table is partitioned by month to keep query performance stable as years of events accumulate; the EDW staging table stores a JSONB snapshot per case alongside indexed scalar columns so the workbench can filter without joining across pipeline tables. Migrations are managed by Alembic so schema changes are versioned and applied consistently across environments.",
+          "acceptance_criteria": [
+            "All product types, document types, and statuses defined in the BRD are represented as enums and referenced by every layer that needs them",
+            "Running the migration command from a clean database creates all tables, indexes, foreign keys, and partition definitions",
+            "Audit event partitions are pre-created so inserts do not fail when a new month begins",
+            "An async session factory is available for the pipeline; no module constructs its own session or engine"
+          ]
+        },
+        {
+          "id": "1.7",
+          "title": "Base abstractions — product handler and document extraction schema",
+          "description": "Two abstract base classes define the contracts every product and every document type will conform to. The product handler base declares the two methods every product must implement (which documents are required for this applicant, and how to validate them) and owns the responsibility of stamping the active config version onto every validation result — so a future handler author cannot forget to record what thresholds were in effect when a decision was made. The document extraction base enforces the platform's single-call verify-and-extract contract: a naive integration would make two AI calls per document (one to verify, one to extract), doubling latency and cost. The base class makes that mistake structurally impossible — subclasses cannot break the single-call invariant because the interface does not support it. Every extracted field is wrapped in a typed envelope carrying a confidence score that downstream rules can read for low-confidence flagging.",
+          "acceptance_criteria": [
+            "Adding a new product requires only a new subclass and a registry entry — no changes to the pipeline or the base class",
+            "Every validation result produced by any handler carries the active config version automatically, without the handler author having to remember to add it",
+            "Processing any document type requires exactly one AI call, never two",
+            "Every field on every extraction schema carries a confidence score readable without unwrapping or casting"
           ]
         }
       ]
     },
     {
       "phase": 2,
-      "name": "Domain Model & Validation Configuration",
+      "name": "Personal Finance Business Story",
+      "description": "The first and currently only product in scope. With the enablers in place, the Personal Finance story is implemented as a vertical slice that fulfils the four document-validation user stories — UN-01 (document completeness), UN-02 (national ID / Iqama validation), UN-03 (salary certificate validation), UN-04 (salary transfer letter validation) — through real Kafka, real DMS, and real AI calls. Adding subsequent products (Credit Cards, Auto Lease, Real Estate Mortgage) will follow this same shape, reusing every enabler unchanged.",
+      "user_stories": [
+        {
+          "id": "UN-01",
+          "category": "Document Validation",
+          "story": "As a credit underwriting reviewer, I want the system to validate for each case that all mandatory documents are present and correct in the system, so I can confirm document completeness before reviewing.",
+          "criteria": "All required documents per product and employer class are listed; missing documents are flagged with a clear 'Missing' label; unexpected or unsupported documents are flagged separately; result with reason displayed as Complete / Missing / Extra / Not compliant."
+        },
+        {
+          "id": "UN-02",
+          "category": "Document Validation",
+          "story": "As a credit underwriting reviewer, I want the system to validate certain fields inside the customer national ID/Iqama document against system fields, so I can confirm identity consistency.",
+          "criteria": "Fields compared: ID number, name. For non-Saudi customers validation is mandatory. For Saudi customers validation is also mandatory and the case must record whether the ID has been OTP-verified. Result per field: Match / Mismatch / Review Manually."
+        },
+        {
+          "id": "UN-03",
+          "category": "Document Validation",
+          "story": "As a credit underwriting reviewer, I want the system to validate certain fields inside the salary certificate document against system fields, so I can confirm salary data accuracy.",
+          "criteria": "Fields validated: customer name, ID number, employer name, job title, basic salary, net salary, employment date. Each field compared between document and CRM/T24. Result per field: Matching / Mismatch / Review Manually."
+        },
+        {
+          "id": "UN-04",
+          "category": "Document Validation",
+          "story": "As a credit underwriting reviewer, I want the system to validate certain fields inside the salary transfer letter against system fields, so I can confirm salary transfer accuracy.",
+          "criteria": "Fields validated: customer name, ID number, employer name, bank transfer name (Al Inmaa), account/IBAN number. Each field compared between document and system. Result per field: Matching / Mismatch / Review Manually."
+        }
+      ],
       "tasks": [
         {
           "id": "2.1",
-          "title": "Define enums and domain models",
-          "details": "Define every enum and domain dataclass/pydantic model the rest of the system depends on. Two files: src/creditunder/domain/enums.py (ProductType, DocumentType, ValidationOutcome, Recommendation, CaseStatus, DocumentStatus, CaseReportStatus, InboundEventStatus, JobType, JobStatus) and src/creditunder/domain/models.py (ExtractedField[T], DocumentResult, CaseResult, ApplicationEvent, EmployerSnapshot, RequiredDocumentSet, ValidationResult). Refer to credit_underwriting_system_requirement.md §6.1–6.4 for the exact enum values, field definitions, and model contracts. Refer to the BRD for the canonical list of in-scope product types and document types — the ProductType and DocumentType enums must mirror the BRD scope.",
-          "deliverables": [
-            "src/creditunder/domain/enums.py",
-            "src/creditunder/domain/models.py"
+          "title": "Document extraction schemas — national ID/Iqama, salary certificate, salary transfer letter",
+          "description": "Each document the bank processes has a unique set of fields and its own rules for what makes it valid. The AI needs document-specific instructions to extract these correctly — generic prompts produce unreliable results. This task produces one extraction schema per document type required by the four user stories, with tailored verification criteria (what disqualifies the document) and field-level extraction guidance (date formats, currency conventions, IBAN normalisation). The schemas are the contract between the AI and the validation rules: every field that UN-02 / UN-03 / UN-04 specify must be extractable from the corresponding document. National ID / Iqama (UN-02) requires ID number, name, and expiry; the schema must also expose nationality so the handler can branch Saudi vs non-Saudi at validation time. Salary certificate (UN-03) requires customer name, ID number, employer name, job title, basic salary, net salary, employment date. Salary transfer letter (UN-04) requires customer name, ID number, employer name, the receiving bank name (which the handler will check matches 'Al Inmaa'), and the account / IBAN number. A central registry resolves DocumentType to schema class so the AI client and the product handler always look up the same schema for the same document type.",
+          "fulfils_stories": ["UN-02", "UN-03", "UN-04"],
+          "acceptance_criteria": [
+            "An extraction schema exists for national ID / Iqama, salary certificate, and salary transfer letter",
+            "Every field listed in UN-02, UN-03, UN-04 acceptance criteria is present on the corresponding schema, named consistently, and typed to match what the validation rule expects",
+            "The national ID / Iqama schema exposes nationality so Saudi vs non-Saudi branching can be applied",
+            "Every document type defined in the domain enum is resolvable through the registry; an unregistered type raises a named exception immediately, not a silent failure"
           ]
         },
         {
           "id": "2.2",
-          "title": "Validation configuration YAML and loader",
-          "details": "src/creditunder/validation_config.yaml: top-level `version` string, `confidence_thresholds` (REQUIRED `default` key + per-DocumentType overrides), per-product numeric tolerances (e.g. `personal_finance.salary_deviation_tolerance`), `recommendation_mapping` (on_hard_breach, on_manual_review, on_soft_mismatch, on_low_confidence, default). src/creditunder/validation_config.py: pydantic schema mirroring the YAML, `get_validation_config()` cached singleton, fail at startup with a clear error if `confidence_thresholds.default` is missing. Refer to credit_underwriting_system_requirement.md §8.3 for the exact YAML structure, the reproducibility contract (config_version stamping), and the explicit list of what does NOT belong in the file (rule logic, branching).",
-          "deliverables": [
-            "src/creditunder/validation_config.yaml",
-            "src/creditunder/validation_config.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 3,
-      "name": "Database Layer",
-      "tasks": [
-        {
-          "id": "3.1",
-          "title": "ORM models and async session",
-          "details": "Implement the SQLAlchemy declarative ORM for every pipeline table and an async session factory. Refer to credit_underwriting_system_requirement.md §8 for the canonical list of tables, the full column-level schema of each one, FK constraints (including the application_case.event_id → inbound_application_event.event_id rule), the append-only vs. mutable-status distinction, the AuditEvent partitioning scheme (RANGE-partitioned on occurred_at, composite PK id+occurred_at), and the EdwStaging design (promoted scalar columns + payload JSONB). Files: src/creditunder/db/models.py (ORM classes) and src/creditunder/db/session.py (a single AsyncSessionLocal factory bound to DATABASE_URL).",
-          "deliverables": [
-            "src/creditunder/db/models.py",
-            "src/creditunder/db/session.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 4,
-      "name": "Document Extraction Schemas",
-      "tasks": [
-        {
-          "id": "4.1",
-          "title": "BaseExtractionSchema (verify+extract single-call pattern)",
-          "details": "Implement the abstract base class that every per-document-type extraction schema in 4.2 will inherit from. The base must encode the design contract that a SINGLE AI call returns both the verification outcome and the extracted fields in one typed response (no separate verify call), and it must declare the abstract hooks each subclass implements (document_type, extraction_prompt, verification_prompt). Refer to credit_underwriting_system_requirement.md §6.2 / §7 for the exact base-class structure, the shared verification fields it must expose, and the single-call verify+extract contract — implement the class and fields as specified there. File: src/creditunder/documents/base.py.",
-          "deliverables": [
-            "src/creditunder/documents/base.py"
+          "title": "Personal Finance product handler — completeness check, per-field validations, tunable thresholds",
+          "description": "The handler encodes every Personal Finance business rule across the four user stories. UN-01 is satisfied by required_documents(applicant_data), which returns the set of documents this applicant must present (varies by employer class A/B/C/D/GOV per the BRD matrix) plus the set of supported types. The pipeline uses the result to flag missing required documents AND unexpected/unsupported uploads, producing the Complete / Missing / Extra / Not compliant outcome the story specifies. UN-02 produces per-field results for ID number and name comparison against the CRM payload, with branching on nationality: for non-Saudi applicants validation is mandatory; for Saudi applicants validation is also mandatory and the result records whether the ID has been OTP-verified upstream (a flag the CRM event carries) so the reviewer sees that context. UN-03 produces seven per-field results for the salary certificate (customer name, ID number, employer name, job title, basic salary, net salary, employment date), each compared against the CRM/T24 snapshot embedded in applicant_data. UN-04 produces per-field results for the salary transfer letter (customer name, ID number, employer name, bank transfer name verified to be 'Al Inmaa', account / IBAN). Every per-field rule emits Matching, Mismatch, or Review Manually — Review Manually is reserved for low-confidence extractions where the AI's confidence falls below the configured threshold. Numeric thresholds (confidence cutoffs, salary deviation tolerance) and the outcome-to-recommendation mapping live in a versioned YAML file so risk teams can tune them without a code deployment; the active version is stamped onto every persisted validation result, so the audit trail can always reproduce which thresholds were in effect when a decision was made — a hard regulatory requirement.",
+          "fulfils_stories": ["UN-01", "UN-02", "UN-03", "UN-04"],
+          "acceptance_criteria": [
+            "UN-01: completeness check produces one of Complete / Missing / Extra / Not compliant. Missing required documents and unexpected/unsupported uploads are both flagged on the case",
+            "UN-01: required document set matches the BRD's employer-class matrix for each employer class (A/B/C/D/GOV)",
+            "UN-02: ID number and name produce per-field Match / Mismatch / Review Manually outcomes",
+            "UN-02: For Saudi applicants, the case records whether the ID has been OTP-verified; validation runs in both Saudi and non-Saudi cases",
+            "UN-03: customer name, ID number, employer name, job title, basic salary, net salary, employment date each produce a Matching / Mismatch / Review Manually outcome compared against CRM/T24",
+            "UN-04: customer name, ID number, employer name, bank transfer name (verified as 'Al Inmaa'), account / IBAN each produce a Matching / Mismatch / Review Manually outcome",
+            "Salary deviation tolerance is read from validation_config.yaml, not a hard-coded number",
+            "The processor refuses to start and prints a clear error if any required threshold key is missing from the config file",
+            "Every persisted validation result carries the config version that was loaded at the time",
+            "Changing a threshold and restarting the processor applies the new threshold to subsequent cases — with no code change"
           ]
         },
         {
-          "id": "4.2",
-          "title": "Per-document-type extraction schemas",
-          "details": "One module per DocumentType, each subclassing BaseExtractionSchema. Refer to the BRD for the authoritative list of in-scope document types — implement one file under src/creditunder/documents/ for each one. For every document type, research the actual document to identify all extractable fields, wrap every field in ExtractedField[T], implement verification_prompt() (what makes this document valid / what disqualifies it) and extraction_prompt() (field-level instructions including date formats, currency conventions, derived fields). The BRD is the source of truth for which fields a given document carries and which of them feed downstream validations.",
-          "deliverables": [
-            "one src/creditunder/documents/<document_type>.py module per DocumentType listed in the BRD"
-          ]
-        },
-        {
-          "id": "4.3",
-          "title": "EXTRACTION_SCHEMA_REGISTRY",
-          "details": "src/creditunder/documents/__init__.py: define `EXTRACTION_SCHEMA_REGISTRY: dict[DocumentType, type[BaseExtractionSchema]]` mapping each DocumentType to its schema class. The AI client and product handlers read from this registry to resolve the schema at runtime — no other module hard-codes the mapping.",
-          "deliverables": [
-            "src/creditunder/documents/__init__.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 5,
-      "name": "External Service Clients",
-      "tasks": [
-        {
-          "id": "5.1",
-          "title": "AI Client",
-          "details": "src/creditunder/services/ai_client.py: AIClient using pydantic-ai. Two methods: (1) `verify_and_extract(document_content, content_type, document_name, expected_type)` returns VerifyAndExtractResult (is_correct_type, verification_confidence, detected_type, extracted_fields) — temperature=0. (2) `generate_narrative(case_summary)` returns a single paragraph for the PDF — temperature=0.3. Backend resolution: prefer OPENAI_API_KEY when set; otherwise use AI_BASE_URL + AI_API_KEY. Model name from AI_MODEL. Refer to credit_underwriting_system_requirement.md §7 for the three AI call points (verification, extraction, narrative), their inputs/outputs, and the single-endpoint design rationale.",
-          "deliverables": [
-            "src/creditunder/services/ai_client.py"
-          ]
-        },
-        {
-          "id": "5.2",
-          "title": "DMS Client",
-          "details": "src/creditunder/services/dms_client.py: async httpx client. Methods: `fetch_document(dms_id) -> bytes + metadata`, `upload_document(content, metadata) -> dms_document_id`. Base URL resolved from settings.DMS_BASE_URL. No retry/backoff logic at this layer — the pipeline owns retries.",
-          "deliverables": [
-            "src/creditunder/services/dms_client.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 6,
-      "name": "Product Handlers",
-      "tasks": [
-        {
-          "id": "6.1",
-          "title": "BaseProductHandler",
-          "details": "src/creditunder/handlers/base.py: ABC with `required_documents(applicant_data) -> RequiredDocumentSet` and `validate(application_id, applicant_data, document_results) -> tuple[list[ValidationResult], Recommendation, str]`. Provide `_stamp_versions(results)` that mutates each ValidationResult to carry the current `validation_config.yaml` version on its `config_version` field. Refer to credit_underwriting_system_requirement.md §6.1 for the full BaseProductHandler contract and §6.1.1 for a worked example showing how validate() should be implemented.",
-          "deliverables": [
-            "src/creditunder/handlers/base.py"
-          ]
-        },
-        {
-          "id": "6.2",
-          "title": "PersonalFinanceHandler",
-          "details": "Implement the Personal Finance product handler at src/creditunder/handlers/personal_finance.py. The handler must implement two methods: required_documents(applicant_data) (the document set required for this product, branching on employer class) and validate(...) (the business rules and recommendation derivation). Refer to the BRD as the source of truth for the implementation logic: which validation rules to emit, how each rule operates on extracted fields and applicant_data, what outcome each branch produces, and the employer-class document matrix used by required_documents(). Refer to credit_underwriting_system_requirement.md §6.1.1 for a canonical worked example showing how to structure validate() — index document_results by type, emit one ValidationResult per rule, wrap every emitted ValidationResult with self._stamp_versions(...), and derive the Recommendation from the outcome mix using validation_config.yaml's recommendation_mapping. Also refer to §5.1 for the employer_snapshot sub-schema the handler reads from applicant_data.",
-          "deliverables": [
-            "src/creditunder/handlers/personal_finance.py"
-          ]
-        },
-        {
-          "id": "6.3",
-          "title": "Handler registry",
-          "details": "src/creditunder/handlers/registry.py: `get_handler(product_type: ProductType) -> BaseProductHandler` returning a singleton instance per type. Raise a clear error for an unregistered ProductType — the processor uses this signal to write `dead_letter_event` with reason_code=UNSUPPORTED_PRODUCT_TYPE.",
-          "deliverables": [
-            "src/creditunder/handlers/registry.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 7,
-      "name": "Pipeline & Report Generator",
-      "tasks": [
-        {
-          "id": "7.1",
-          "title": "Report HTML template",
-          "details": "src/creditunder/pipeline/templates/report.html: Jinja2 template optimised for WeasyPrint rendering. Required panels (per credit_underwriting_system_requirement.md §12.2.3): applicant summary, document panel (per-doc + extracted fields), validation table grouped by outcome (4-column layout: rule_code, outcome, expected vs actual, confidence), employer rules panel when employer_snapshot is present, manual checks panel, technical exceptions panel (neutral grey, dashed border — visually distinct from business outcomes per BR-37), recommendation block, audit timeline. Add page-break guards (`page-break-inside: avoid`) on every card / table row.",
-          "deliverables": [
-            "src/creditunder/pipeline/templates/report.html"
-          ]
-        },
-        {
-          "id": "7.2",
-          "title": "ReportGenerator",
-          "details": "src/creditunder/pipeline/report_generator.py: orchestrate report generation. Steps: (1) call AIClient.generate_narrative with the case summary, (2) for each source document, fetch via DMSClient and embed as a base64 data URI in the template context (so the PDF is fully self-contained), (3) render the Jinja2 template to HTML and persist to case_report.html_content, (4) convert HTML to PDF via WeasyPrint, (5) upload PDF via DMSClient.upload_document and set case_report.pdf_dms_document_id. On any failure: set case_report.status=FAILED with a populated error_detail (never silently null). Refer to credit_underwriting_system_requirement.md §9 for the report-generation segment of the sequence diagram, §3 for the HTML-first-then-PDF rationale (HTML stored so regen does not re-run the pipeline), and §11 for the failure-handling contract on case_report.",
-          "deliverables": [
-            "src/creditunder/pipeline/report_generator.py"
-          ]
-        },
-        {
-          "id": "7.3",
-          "title": "ApplicationProcessor — Kafka consumer + pipeline orchestration",
-          "details": "src/creditunder/pipeline/processor.py: the top-level orchestrator. Components and required behaviour:\n  • Kafka consumer wired to KAFKA_BOOTSTRAP_SERVERS / KAFKA_TOPIC / KAFKA_CONSUMER_GROUP via aiokafka.\n  • `_recover_stuck_cases()` runs ONCE at startup BEFORE the consumer starts: every ApplicationCase in CREATED or IN_PROGRESS is marked FAILED with a clear error_detail (the previous processor was killed mid-flight).\n  • Per Kafka message: dedupe on `event_id` against InboundApplicationEvent unique constraint; on duplicate, drop silently.\n  • Resubmission policy: when a NEW event_id arrives for an EXISTING application_id, mark the prior ApplicationCase row SUPERSEDED and create a fresh row (do NOT update the prior row).\n  • Create/find ApplicationCase, set status CREATED → IN_PROGRESS.\n  • Fetch + verify + extract every document concurrently via `asyncio.gather`. On AIClient technical exception (timeout, 5xx) propagate to fail the case. On `is_correct_type=false`, emit a DocumentResult with verification_passed=False (handler will translate to HARD_BREACH / DECLINE).\n  • Completeness check against handler.required_documents(applicant_data). On missing: status=MANUAL_INTERVENTION_REQUIRED, write dead_letter_event(reason_code=MISSING_REQUIRED_DOCUMENTS).\n  • Call handler.validate(); persist every ValidationResult to validation_result; set ApplicationCase.status=COMPLETED with the recommendation.\n  • Call ReportGenerator.generate(); set ApplicationCase.completed_at ONLY after PDF upload succeeds (per design §11 terminal-state guarantee).\n  • Call `_write_edw_staging()`: query every committed pipeline row for the case and assemble a single EdwStaging insert with the full payload JSONB plus all promoted columns.\nAlso provide a module entrypoint at src/creditunder/__main__.py that configures structlog and runs `asyncio.run(ApplicationProcessor().run())` so the package can be launched via `python -m creditunder`.\nRefer to credit_underwriting_system_requirement.md §5 (event contract), §9 (full sequence diagram), §11 (failure handling per stage), §11.2 (resubmission policy).",
-          "deliverables": [
-            "src/creditunder/pipeline/processor.py",
-            "src/creditunder/__main__.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 8,
-      "name": "Mockup Services",
-      "tasks": [
-        {
-          "id": "8.1",
-          "title": "DMS mockup",
-          "details": "mockups/dms/app.py: FastAPI app listening on port 8001 (host port configurable via DMS_PORT). Disk-backed store rooted at /data inside the container. Endpoints: GET /documents/{id} (metadata + base64 content), GET /documents/{id}/raw (binary stream), POST /documents (accepts base64 JSON body, persists, returns assigned document_id), GET /documents (list), GET /health. Pre-seed two documents at startup if the data dir is empty: DMS-00192 (national ID for Mohammed Al-Harbi) and DMS-00193 (Saudi Aramco salary certificate, total_salary=18500).",
-          "deliverables": [
-            "mockups/dms/app.py"
-          ]
-        },
-        {
-          "id": "8.2",
-          "title": "CRM mockup app + Kafka publisher CLI + sample events",
-          "details": "Three files:\n  • mockups/crm/app.py: FastAPI app on port 8003 (host port configurable via CRM_PORT). POST /publish accepts an event payload and forwards it to Kafka via an aiokafka producer (uses the broker from 1.4 + 9.2).\n  • mockups/crm/publisher.py: standalone CLI. `python -m mockups.crm.publisher` publishes ALL sample events; `--event-index N` publishes one. Targets KAFKA_BOOTSTRAP_SERVERS / KAFKA_TOPIC.\n  • mockups/crm/sample_data.py: SAMPLE_EVENTS list with two Personal Finance events:\n    - APP-2026-089341 — happy path (declared_salary matches certificate within tolerance — handler should produce Recommendation.NO_ISSUES).\n    - APP-2026-089342 — salary mismatch (declared 25000 vs certificate 18500, exceeds 10% tolerance — handler should produce Recommendation.HOLD via SOFT_MISMATCH).\n    Both events MUST include the full applicant_data.employer_snapshot (employer_id=EMP-ARAMCO, employer_name_normalized=SAUDI ARAMCO, employer_class=A) and conform to the event schema in credit_underwriting_system_requirement.md §5.",
-          "deliverables": [
-            "mockups/crm/app.py",
-            "mockups/crm/publisher.py",
-            "mockups/crm/sample_data.py"
-          ]
-        }
-      ]
-    },
-    {
-      "phase": 9,
-      "name": "Containerization & Orchestration",
-      "tasks": [
-        {
-          "id": "9.1",
-          "title": "Application Dockerfile and entrypoint",
-          "details": "Build the container image for the main application. src/creditunder/Dockerfile: Python 3.14 base, install uv, copy pyproject.toml + uv.lock, run `uv sync --frozen`, copy src/. Default CMD invokes entrypoint.sh. src/creditunder/entrypoint.sh: wait for postgres (TCP probe on postgres:5432) and kafka (TCP probe on kafka:9092), then exec `uv run python -m creditunder`.",
-          "deliverables": [
-            "src/creditunder/Dockerfile",
-            "src/creditunder/entrypoint.sh"
-          ]
-        },
-        {
-          "id": "9.2",
-          "title": "Extend docker-compose with postgres, processor, and mockups",
-          "details": "Augment the docker-compose.yml created in 1.4 (which already has kafka + kafka-init). Add four services:\n  • postgres — image postgres:16, internal-only (NOT host-exposed), persisted volume. POSTGRES_USER=creditunder, POSTGRES_DB=creditunder. Healthcheck via pg_isready.\n  • processor — built from src/creditunder/Dockerfile. Internal-only. Environment block sets DATABASE_URL=postgresql+asyncpg://...@postgres:5432/creditunder and KAFKA_BOOTSTRAP_SERVERS=kafka:9092 (these are NEVER in .env). Inherits AI_*, DMS_BASE_URL, CRM_BASE_URL, KAFKA_TOPIC, KAFKA_CONSUMER_GROUP from .env. depends_on postgres + kafka with service_healthy / service_started conditions.\n  • dms — built from mockups/dms/, exposes container 8001 to host port ${DMS_PORT:-8001}.\n  • crm — built from mockups/crm/, exposes container 8003 to host port ${CRM_PORT:-8003}. Inherits KAFKA_BOOTSTRAP_SERVERS=kafka:9092 from the env block.\nKafka stays internal-only — events are published from inside the network (CRM container or `docker compose exec crm python -m mockups.crm.publisher`).",
-          "deliverables": [
-            "docker-compose.yml (full stack: kafka, kafka-init, postgres, processor, dms, crm)"
-          ]
-        },
-        {
-          "id": "9.3",
-          "title": "Makefile targets",
-          "details": "Targets: `infra` (compose up postgres + kafka + dms + crm + processor in foreground, attached to processor logs), `infra-bg` (compose up everything detached EXCEPT processor — useful for running the processor on the host during dev), `down` (compose down), `logs` (tail processor logs), `fmt` (black + isort), `lint` (flake8).",
-          "deliverables": [
-            "Makefile"
+          "id": "2.3",
+          "title": "End-to-end pipeline — Kafka consumer, orchestration, report generation, sample applicants",
+          "description": "This is what wires every enabler into a working product. A long-running processor consumes Kafka events and drives each application through the full lifecycle: deduplicate (so a Kafka redelivery does not double-process), create or load the case, fetch every document from DMS concurrently, run the AI verify-and-extract per document, check completeness against the handler's required documents (UN-01), run the handler's per-field validation rules (UN-02 / UN-03 / UN-04), and persist the recommendation. Once business processing is committed, the report generator produces the deliverable: an AI-written narrative paragraph opens the report, source documents are re-fetched from DMS and embedded directly into the PDF as base64 (so the PDF is fully self-contained), the HTML is rendered from a Jinja2 template and persisted independently in the database (so the PDF can be regenerated without re-running the pipeline if rendering produces a corrupt file), the PDF is rendered, and the PDF is uploaded back to DMS. A CRM mockup ships with sample applicants chosen to demonstrate each user story end-to-end: a happy-path case where every document and every field passes, a missing-document case (UN-01 Missing), an extra-document case (UN-01 Extra), a Saudi vs non-Saudi pair (UN-02 branching), a salary-mismatch case (UN-03 Mismatch on basic salary), and a transfer-letter mismatch case (UN-04 Mismatch on IBAN). Startup recovery marks any case left in a non-terminal state by a previous run as FAILED so operators can resubmit. The pipeline's completed_at timestamp is only written after the PDF upload succeeds, enforcing the platform's terminal-state guarantee: a COMPLETED case always has a delivered report. Technical exceptions (infrastructure failures, AI timeouts) are captured with a visually distinct treatment in the PDF — a regulatory requirement so a credit officer cannot mistake a system error for a deliberate DECLINE.",
+          "fulfils_stories": ["UN-01", "UN-02", "UN-03", "UN-04"],
+          "acceptance_criteria": [
+            "A sample event exists and runs end-to-end for each user story scenario: happy path, UN-01 Missing, UN-01 Extra, UN-02 Saudi, UN-02 non-Saudi, UN-03 salary mismatch, UN-04 IBAN mismatch",
+            "Each sample case produces the expected recommendation and a PDF uploaded to DMS",
+            "Redelivering the same Kafka message twice results in exactly one processed case",
+            "Cases left in CREATED or IN_PROGRESS when the processor restarts are marked FAILED with an explanatory message",
+            "completed_at is written only after the PDF upload to DMS succeeds — never before",
+            "The generated PDF can be opened with no external references (images, fonts, source document previews are all embedded)",
+            "The HTML used to produce the PDF is stored in the database independently, so the PDF can be regenerated without reprocessing",
+            "The technical exceptions panel in the PDF is rendered with a visual treatment clearly distinct from the validation outcomes panel"
           ]
         }
       ]
