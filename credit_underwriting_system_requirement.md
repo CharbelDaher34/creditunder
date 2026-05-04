@@ -4,7 +4,7 @@
 
 ## Business Case
 
-Alinma Bank processes credit applications by assigning each case to a human Validator. Today, that Validator manually fetches supporting documents from the Document Management System (DMS), reads each one, extracts key data fields, cross-checks those fields against the applicant's CRM record, applies business rules, and writes a recommendation. This process is slow (multi-hour per case), inconsistent across validators, and leaves no structured audit trail beyond PDF printouts stored in Siebel CRM.
+Alinma Bank processes credit applications by assigning each case to a human Validator. Today, that Validator manually fetches supporting documents from the Document Management System (DMS), reads each one, extracts key data fields, cross-checks those fields against the applicant's CRM record, applies business rules, and writes a recommendation. This process is slow, inconsistent across validators.
 
 **Our solution eliminates the manual extraction and validation work.** When Siebel CRM submits a credit application, this platform:
 
@@ -127,13 +127,13 @@ Whichever transport is used, the payload must carry the fields below:
 
 #### 5.1 `applicant_data.employer_snapshot` sub-schema
 
-The Personal Finance handler (and any future product handler that varies its required-document set or rules by employer) reads the employer context from this sub-object. CRM resolves the employer record against the governed employer-rules source (BR-11 / BR-16) and embeds the snapshot at publish time so the processor never fetches employer data itself.
+The Personal Finance handler (and any future product handler that varies its required-document set or rules by employer) reads the employer context from this sub-object. CRM resolves the employer record against the governed employer-rules source and embeds the snapshot at publish time so the processor never fetches employer data itself.
 
 | Field | Type | Description |
 |---|---|---|
 | `employer_id` | string | Canonical employer identifier from the rules source. |
-| `employer_name_normalized` | string | Canonical normalised name — used as the comparison anchor for the employer-name validation (BR-07). |
-| `employer_class` | enum (`A`, `B`, `C`, `D`, `GOV`) | Employer class assigned by the governed rules source. Drives the required-document matrix (BR-13 / BR-14). |
+| `employer_name_normalized` | string | Canonical normalised name — used as the comparison anchor for the employer-name validation. |
+| `employer_class` | enum (`A`, `B`, `C`, `D`, `GOV`) | Employer class assigned by the governed rules source. Drives the required-document matrix. |
 
 **Example event payload:**
 
@@ -191,7 +191,7 @@ class ProductType(str, Enum):
 class RequiredDocumentSet:
     # The handler tells the Application Processor what to expect *for this applicant*,
     # because the required set may depend on `applicant_data` — most importantly
-    # the employer class snapshot (BR-13 / BR-14).
+    # the employer class snapshot.
     required: set[DocumentType]                  # must all be present
     optional: set[DocumentType] = set()          # accepted if present, ignored if absent
     unsupported: set[DocumentType] = set()       # must not be present; flagged if uploaded
@@ -403,8 +403,6 @@ class CaseResult(BaseModel):
     manual_review_required: bool = False
     completed_at: datetime
 ```
-
-> **To be confirmed with BRD:** The exact fields, recommendation thresholds, and validation rules that drive `Recommendation` and `ValidationOutcome` must be reviewed and aligned with the Business Requirements Document before implementation.
 
 ---
 
@@ -688,7 +686,7 @@ recommendation_mapping:
 2. Restart the processor to load the new file.
 3. New rows reference the new `config_version`; historical rows still reference whatever version was in force when they were written.
 
-This guarantees the BR-30 explainability PDF and the Workbench's checks table can always show *which* threshold version produced any given outcome.
+This guarantees the explainability PDF and the Workbench's checks table can always show *which* threshold version produced any given outcome.
 
 **What does NOT belong in this file.** The validation logic itself — which rules exist, how they branch on data, what `rule_code` they emit — is owned by the handler classes and stays under code review. The YAML carries only thresholds, tolerances, and the outcome→recommendation mapping. If a behavioural change requires a new rule or a new branch, that is a code change.
 
@@ -864,7 +862,7 @@ Failures are grouped into three categories: external (DMS, AI Service, Kafka, ED
 
 `application_case.completed_at` is set **only** when both delivery sides (report uploaded, EDW exported) have succeeded. A NULL `completed_at` on a `COMPLETED` case is the unambiguous signal that something downstream is unresolved — the specific failure is on the relevant child row.
 
-**Tech-exception vs business-outcome visual distinction.** Pipeline / integration failures (anything written to `*.error_detail` or `edw_staging.export_error`) are surfaced in both the Workbench detail view and the BR-30 explainability PDF as a separate **Technical Exceptions** panel with a neutral grey, dashed-border palette — distinct from the business-outcome chips (green/amber/red) used for `ValidationOutcome`. This guarantees a reviewer never confuses a DMS outage or an AI 5xx with a rule decline (BR-37).
+**Tech-exception vs business-outcome visual distinction.** Pipeline / integration failures (anything written to `*.error_detail` or `edw_staging.export_error`) are surfaced in both the Workbench detail view and the explainability PDF as a separate **Technical Exceptions** panel with a neutral grey, dashed-border palette — distinct from the business-outcome chips (green/amber/red) used for `ValidationOutcome`. This guarantees a reviewer never confuses a DMS outage or an AI 5xx with a rule decline.
 
 ---
 
