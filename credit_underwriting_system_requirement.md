@@ -6,7 +6,9 @@
 
 Alinma Bank processes credit applications by assigning each case to a human Validator. Today, that Validator manually fetches supporting documents from the Document Management System (DMS), reads each one, extracts key data fields, cross-checks those fields against the applicant's CRM record, applies business rules, and writes a recommendation. This process is slow, inconsistent across validators.
 
-**Our solution eliminates the manual extraction and validation work.** When Siebel CRM submits a credit application, this platform:
+**Two systems of origin:** Personal Finance, Credit Cards, and Auto Lease are managed in **Siebel CRM**; Real Estate Mortgage is managed in **T24** — CRM never holds a mortgage case. Both systems feed the same pipeline (see Section 13).
+
+**Our solution eliminates the manual extraction and validation work.** When a source system submits a credit application, this platform:
 
 1. Automatically fetches all required documents from DMS.
 2. Verifies each document is visually what it claims to be (using AI).
@@ -27,7 +29,7 @@ The Validator's role shifts from manual data gathering to reviewing a pre-assemb
 
 ### 1. Purpose and Context
 
-This platform automates credit application processing at Alinma Bank. When the source system (Siebel CRM in the MVP) submits a credit application event — over Kafka or a REST API call to our inbound endpoint — the system:
+This platform automates credit application processing at Alinma Bank. The source system depends on the product line — **Siebel CRM** for Personal Finance, Credit Cards, and Auto Lease; **T24** for Real Estate Mortgage. When either submits a credit application event — over Kafka or a REST API call to our inbound endpoint — the system:
 
 1. Fetches the application documents from DMS.
 2. Verifies each document matches its declared type (using AI).
@@ -51,8 +53,9 @@ The platform is built on four fixed pillars:
 
 | Participant | Role |
 |---|---|
-| **Siebel CRM** | Two interactions with this system: **(1) Event publisher** — triggers processing by publishing a credit-application event (over Kafka or a REST call to our inbound endpoint) with `applicant_data` and document identifiers. **(2) Output consumer** — reads the final PDF report from DMS and the structured case data from EDW once the pipeline completes, plus an optional completion notification (Section 13.6). The exact direction of calls (Siebel → us, or us → Siebel for a Pattern C pull or a REST callback) depends on the integration pattern chosen in Section 13. |
-| **Kafka** | Event bus that buffers application-processing events and decouples Siebel CRM from pipeline latency. Events are durable and replayable. |
+| **Siebel CRM** | System of origin for **Personal Finance, Credit Cards, and Auto Lease**. **(1) Event publisher** — publishes credit-application events with `applicant_data` and document IDs. **(2) Output consumer** — reads the PDF from DMS and structured data from EDW on completion. Integration pattern detail in Section 13. |
+| **T24** | System of origin for **Real Estate Mortgage** (CRM never holds mortgage cases). Publishes mortgage events directly into the pipeline using the same `InboundApplicationEvent` contract (Section 13.3). Also the source of core-banking / account data embedded in `applicant_data`. |
+| **Kafka** | Event bus that buffers application-processing events and decouples the source systems (Siebel CRM, T24) from pipeline latency. Events are durable and replayable. |
 | **Application Processor** | Consumes Kafka events, creates the case in Postgres, invokes the product handler, receives the `CaseResult`, delegates report generation, and writes the final output to EDW. It coordinates the pipeline — it contains no business logic. |
 | **Product Handler** | One class per `ProductType`. Owns the required document list, extraction routing, validation rules, and recommendation logic for that product. The Application Processor is unaware of product-specific rules. |
 | **AI Service** | The single AI service for all AI tasks: document type verification, structured data extraction, and report narrative generation. All three calls use the same endpoint; the task is selected via the system prompt and expected output schema. |
@@ -936,7 +939,7 @@ Both options use the same underlying outputs, so the choice is purely operationa
 
 ### 13. Source System Integration Patterns
 
-> Sections 5–11 describe the system as if a single source (Siebel CRM) publishes a single Kafka event carrying everything we need (`applicant_data` + `document_ids`). That contract is the easiest to operate, but in practice applicant data is owned across at least two systems — **Siebel CRM** (customer profile, employer, declared salary) and **T24** (core banking / account data). This section describes how the input path can vary without changing the core processing logic, and how the platform reports completion back to whichever system originated the request.
+> Sections 5–11 describe the system as if a single source (Siebel CRM) publishes a single Kafka event carrying everything we need (`applicant_data` + `document_ids`). That contract is the easiest to operate, but in practice the bank's credit business is split across two systems of origin: **Siebel CRM** owns Personal Finance, Credit Cards, and Auto Lease end to end, while **Real Estate Mortgage** is originated and managed in **T24**. CRM also remains the source of customer-profile and employer data; T24 also remains the source of core banking / account data — but the system-of-origin distinction is what makes integrating with T24 a hard requirement, not just a data-fetch convenience: any mortgage application has to enter the pipeline through T24 because CRM never sees it. This section describes how the input path can vary without changing the core processing logic, and how the platform reports completion back to whichever system originated the request.
 
 **Core invariant.** The Application Processor operates on a fully-formed `applicant_data` object plus a list of `document_ids`. Where those values come from is an integration concern, not a pipeline concern. **Sections 5–11 still apply unchanged once the input has been assembled** — only the component sitting *in front of* the Application Processor changes between patterns.
 
@@ -1002,7 +1005,7 @@ sequenceDiagram
 
 #### 13.3 Pattern B — Push from one of multiple sources
 
-Either source system can publish a complete event for a given case — but only one publishes per case (not both contributing slices). For example, retail-banking-originated cases may come from Siebel CRM while corporate-banking cases come from T24. Each source produces its own event format; the Source Adapter normalises both into the same internal `InboundApplicationEvent` before handing off.
+Either source system can publish a complete event for a given case — but only one publishes per case (not both contributing slices). **This is the pattern the bank's product split actually requires:** Personal Finance, Credit Cards, and Auto Lease originate in Siebel CRM and are published from there, while Real Estate Mortgage is originated in T24 and must be published from T24 — CRM never holds the mortgage case, so a CRM-only ingestion path cannot serve it. Each source produces its own event format; the Source Adapter normalises both into the same internal `InboundApplicationEvent` before handing off, so the Application Processor and product handlers remain unaware of which system the case came from.
 
 ```mermaid
 sequenceDiagram
