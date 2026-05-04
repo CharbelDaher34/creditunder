@@ -18,7 +18,6 @@ The full system design rationale is in [credit_underwriting_system_requirement.m
 - Jinja2 + WeasyPrint for HTML-to-PDF report generation
 - Vue 3 + Vite (TypeScript) for the Reviewer Workbench UI — served by nginx
 - structlog for structured logging
-- OpenTelemetry SDK scaffolded in `otel_observability.py` (not wired to the pipeline yet)
 
 ## Commands
 
@@ -74,7 +73,6 @@ src/creditunder/
 │                           #   row (`config_version`) so the audit trail is reproducible.
 ├── validation_config.py    # Loader (pydantic) — get_validation_config() returns a cached instance.
 ├── observability.py        # structlog configuration
-├── otel_observability.py   # OpenTelemetry scaffolding — Telemetry singleton (not wired to pipeline yet)
 ├── __main__.py             # entrypoint → ApplicationProcessor.run()
 ├── Dockerfile              # Dockerfile for the processor service
 ├── entrypoint.sh           # Docker entrypoint (waits for infra, runs migrations, starts processor)

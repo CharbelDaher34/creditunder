@@ -60,7 +60,7 @@ The platform is built on four fixed pillars:
 | **EDW** | Alinma's Enterprise Data Warehouse — an existing company-wide system. Receives the settled final output in a single write per case. EDW does not support mid-pipeline queries; all data is staged in Postgres first and written to EDW atomically at the end. |
 | **DMS** | Document Management System. Source of application documents; destination for the final PDF report. |
 | **Report Generator** | In-process service. Calls AI Service for narrative text, assembles the report in HTML (for full layout control), stores the HTML in Postgres, converts to PDF via headless browser, and writes the PDF to DMS. |
-| **Observability and Audit** | All telemetry is to be emitted via the OpenTelemetry (OTel) SDK and exported to an OTel-compatible backend. The wrapping client lives in `src/creditunder/otel_observability.py` (class `Telemetry`) and exposes the standard span/counter/histogram surface. The class is currently scaffolding-only — it is not yet wired into the pipeline. Until then, runtime logging is handled by `structlog` (JSON to stdout + rotating file). Immutable business audit records are written to Postgres (`audit_event`) for long-term queryable history independent of the observability platform's retention window. |
+| **Observability and Audit** | Runtime logging is handled by `structlog` (structured JSON to stdout + rotating file). Immutable business audit records are written to Postgres (`audit_event`) for long-term queryable history. |
 | **Validator / Supervisor** | Human bank staff. Validators review cases assigned to them. Supervisors review all cases under their team. Both interact only through the internal UI (described in Section 12) and through Siebel CRM — they have no direct interaction with this system's API or database. |
 
 ---
@@ -177,7 +177,9 @@ class ProductType(str, Enum):
     # To support a new credit product, add an entry here and create a new handler class.
     # No other file needs to change.
     PERSONAL_FINANCE = "PERSONAL_FINANCE"
-    AUTO_FINANCE = "AUTO_FINANCE"
+    CREDIT_CARDS = "CREDIT_CARDS"
+    AUTO_LEASE = "AUTO_LEASE"
+    REAL_ESTATE_MORTGAGE = "REAL_ESTATE_MORTGAGE"
 
 
 @dataclass
@@ -806,17 +808,15 @@ If document volume grows significantly (large files, high concurrency), fetching
 
 #### 10.3 Structured Logging and Observability
 
-All telemetry is emitted via the **OpenTelemetry (OTel)** SDK (logs, traces, metrics) and exported to any OTLP-compatible backend. No vendor-specific SDK is used in application code.
+All runtime logging is handled by **structlog** (structured JSON to stdout + rotating file). No OTel SDK is used.
 
 | Signal | What it captures |
 |---|---|
-| **Logs** | JSON, structured key-value attributes (never embedded strings). Standard fields on every entry: `application_id`, `event_id`, `trace_id`, `span_id`, `component`, `log_level`, `timestamp`, `message`. |
-| **Traces** | Root span per Kafka event, child spans per stage (DMS fetch, AI verify, AI extract, validate, report, EDW write). Gives a full latency breakdown per case. |
-| **Metrics** | Counters and histograms: events consumed, cases created, verification/extraction/validation outcomes, report upload, EDW write, end-to-end duration. |
+| **Logs** | Structured JSON, key-value attributes (never embedded strings). Standard fields on every entry: `application_id`, `event_id`, `component`, `log_level`, `timestamp`, `message`. |
 
 **Log level policy:** `DEBUG` — field values and internal transitions; `INFO` — pipeline milestones; `WARN` — degraded but non-blocking (low confidence, soft mismatch, retrying); `ERROR` — stage-blocking failures.
 
-**Audit log** — business-significant events are also written to `audit_event` in Postgres: an immutable, queryable trail independent of the observability platform's retention window.
+**Audit log** — business-significant events are also written to `audit_event` in Postgres: an immutable, queryable trail independent of log retention.
 
 #### 10.4 Non-Error Points of Failure
 
