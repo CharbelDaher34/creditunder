@@ -12,7 +12,7 @@ Alinma Bank processes credit applications by assigning each case to a human Vali
 2. Verifies each document is visually what it claims to be (using AI).
 3. Extracts structured data fields from each document (using AI).
 4. Applies the product's business validation rules to the extracted data against the applicant's CRM records.
-5. Generates a structured, human-readable PDF report summarising the case, all validations, and a system recommendation (APPROVE / HOLD / DECLINE).
+5. Generates a structured, human-readable PDF report summarising the case, all validations, and a system recommendation (NO_ISSUES / HOLD / DECLINE).
 6. Delivers the PDF back into DMS and the structured data into the Enterprise Data Warehouse (EDW), so the Validator receives a complete, ready-to-act case package.
 
 The Validator's role shifts from manual data gathering to reviewing a pre-assembled report and acting on the recommendation. Processing time drops significantly. Every extraction, every validation result, and every system decision is stored immutably for compliance and audit.
@@ -229,6 +229,85 @@ class BaseProductHandler(ABC):
         raise NotImplementedError
 ```
 
+##### 6.1.1 Worked example — `PersonalFinanceHandler.validate()`
+
+The following is a minimal, illustrative implementation showing how the handler
+consumes `document_results` and `applicant_data`, emits one `ValidationResult`
+per rule, and derives a `Recommendation` from the outcome mix. It is intended
+to make the data flow concrete — production rules are richer.
+
+```python
+class PersonalFinanceHandler(BaseProductHandler):
+    product_type = ProductType.PERSONAL_FINANCE
+
+    def validate(self, application_id, applicant_data, document_results):
+        # 1. Index document results by type for direct field access.
+        id_doc = next(d for d in document_results
+                      if d.document_type == DocumentType.ID_DOCUMENT)
+        salary_doc = next(d for d in document_results
+                          if d.document_type == DocumentType.SALARY_CERTIFICATE)
+
+        results: list[ValidationResult] = []
+
+        # 2. Cross-check rule: ID number on the document matches CRM record.
+        crm_id = applicant_data["id_number"]
+        extracted_id = id_doc.fields.id_number  # ExtractedField[str]
+        results.append(ValidationResult(
+            rule_code="ID_NUMBER_MISMATCH",
+            input_data={"crm": crm_id, "document": extracted_id.value},
+            outcome=ValidationOutcome.PASS if extracted_id.value == crm_id
+                    else ValidationOutcome.HARD_BREACH,
+            details={"expected": crm_id, "actual": extracted_id.value},
+            confidence=extracted_id.confidence,
+        ))
+
+        # 3. Tolerance rule: declared salary vs. salary certificate (yaml-driven).
+        cfg = get_validation_config()
+        tolerance = cfg.personal_finance.salary_deviation_tolerance  # e.g. 0.10
+        declared = Decimal(str(applicant_data["declared_salary"]))
+        actual = salary_doc.fields.total_salary.value
+        deviation = abs(declared - actual) / declared
+        results.append(ValidationResult(
+            rule_code="SALARY_DEVIATION",
+            input_data={"declared": float(declared), "certificate": float(actual)},
+            outcome=ValidationOutcome.PASS if deviation <= tolerance
+                    else ValidationOutcome.SOFT_MISMATCH,
+            details={"deviation_pct": float(deviation), "tolerance": tolerance},
+            confidence=salary_doc.fields.total_salary.confidence,
+        ))
+
+        # 4. Map the outcome mix to a Recommendation via the yaml mapping.
+        #    Precedence: HARD_BREACH > MANUAL_REVIEW > SOFT_MISMATCH > LOW_CONFIDENCE.
+        outcomes = {r.outcome for r in results}
+        mapping = cfg.recommendation_mapping
+        if ValidationOutcome.HARD_BREACH in outcomes:
+            recommendation = mapping.on_hard_breach           # DECLINE
+        elif ValidationOutcome.SOFT_MISMATCH in outcomes:
+            recommendation = mapping.on_soft_mismatch          # HOLD
+        else:
+            recommendation = mapping.default                   # NO_ISSUES
+
+        rationale = f"{len(results)} rules evaluated; recommendation={recommendation}"
+        # 5. Stamp config_version onto every row before returning (audit contract).
+        return self._stamp_versions(results), recommendation, rationale
+```
+
+**Example data flow** — given the sample event `APP-2026-089342`
+(`declared_salary=25000`, salary certificate `total_salary=18500`, tolerance
+`0.10`):
+
+| Rule | Outcome | Why |
+|---|---|---|
+| `ID_NUMBER_MISMATCH` | `PASS` | Extracted ID matches `applicant_data.id_number` |
+| `SALARY_DEVIATION` | `SOFT_MISMATCH` | Deviation ≈ 0.26, exceeds 0.10 tolerance |
+
+Recommendation resolves to `HOLD` via `recommendation_mapping.on_soft_mismatch`.
+The handler returns two `ValidationResult` rows, each stamped with the YAML
+`config_version` — both rows persist to `validation_result` and surface in the
+report, the workbench, and the EDW payload.
+
+---
+
 #### 6.2 Document types
 
 ```python
@@ -283,7 +362,7 @@ The product handler returns a single `CaseResult` to the Application Processor. 
 
 ```python
 class Recommendation(str, Enum):
-    APPROVE = "APPROVE"
+    NO_ISSUES = "NO_ISSUES"
     HOLD = "HOLD"
     DECLINE = "DECLINE"
 
@@ -378,7 +457,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `supervisor_id` | string NOT NULL | |
 | `applicant_data` | JSONB NOT NULL | Snapshot from the Kafka event — authoritative for this case. Includes the `employer_snapshot` sub-object (Section 5.1) when the product handler needs employer context |
 | `status` | string NOT NULL | `CREATED` → `IN_PROGRESS` → `COMPLETED` (or `FAILED` / `MANUAL_INTERVENTION_REQUIRED`). `COMPLETED` means business processing produced a recommendation; delivery state lives on `case_report` and `edw_staging` |
-| `recommendation` | string | `APPROVE`, `HOLD`, `DECLINE` — set after handler completes |
+| `recommendation` | string | `NO_ISSUES`, `HOLD`, `DECLINE` — set after handler completes |
 | `recommendation_rationale` | text | Free-form rationale string emitted alongside the recommendation |
 | `manual_review_required` | boolean NOT NULL DEFAULT false | |
 | `error_detail` | text | Top-level pipeline failure description. Set whenever `status` is `FAILED` or `MANUAL_INTERVENTION_REQUIRED`. Never silently null on failure — every error path captures here |
@@ -536,7 +615,7 @@ All runtime state is held in Postgres. The schema is designed for idempotent ret
 | `branch_name` | string NOT NULL | Promoted — available for reporting without JSONB access |
 | `applicant_name` | string | Extracted from `applicant_data.name` at staging time — supports search |
 | `status` | string NOT NULL | Final case status at completion time |
-| `recommendation` | string | `APPROVE`, `HOLD`, `DECLINE` — promoted for dashboard filtering |
+| `recommendation` | string | `NO_ISSUES`, `HOLD`, `DECLINE` — promoted for dashboard filtering |
 | `manual_review_required` | boolean NOT NULL | Promoted — surfaces priority flag without JSONB access |
 | `pdf_dms_document_id` | string | DMS identifier of the uploaded PDF report |
 | `error_detail` | text | Top-level pipeline error if any, promoted for the workbench exceptions panel |
@@ -591,7 +670,7 @@ recommendation_mapping:
   on_manual_review: HOLD
   on_soft_mismatch: HOLD
   on_low_confidence: HOLD
-  default: APPROVE
+  default: NO_ISSUES
 ```
 
 **Reproducibility contract.** Every `validation_result` row is stamped with the `version` string above (`config_version` column). When the file changes:
@@ -904,7 +983,7 @@ At each login, the Workbench loads all cases in scope for the authenticated user
 | Branch name | `application_case.branch_name` |
 | Submission date | `application_case.created_at` |
 | Status banner | `application_case.status` — displayed as a coloured badge: IN_PROGRESS (blue), COMPLETED (green), FAILED (red), MANUAL_INTERVENTION_REQUIRED (amber) |
-| Recommendation badge | `case_result.recommendation` — shown only when status = COMPLETED: APPROVE (green), HOLD (amber), DECLINE (red) |
+| Recommendation badge | `case_result.recommendation` — shown only when status = COMPLETED: NO_ISSUES (green), HOLD (amber), DECLINE (red) |
 
 Cards are sorted by submission date descending. The Validator can filter by status or recommendation client-side. MANUAL_INTERVENTION_REQUIRED cases are pinned to the top of the list regardless of date.
 
@@ -938,7 +1017,7 @@ Selecting a card opens the detail view. It shows the full picture of the case in
 
 **Technical Exceptions panel** (BR-36 / BR-37) — collects every `*.error_detail` and `edw_staging.export_error` for the case. Rendered with a visually distinct palette (neutral grey, dashed border) so an integration or extraction failure is never confused with a business-rule outcome. A non-empty panel does not change the recommendation; it tells the reviewer something downstream is unresolved.
 
-**Recommendation block** — the system recommendation (APPROVE / HOLD / DECLINE) displayed prominently, with a manual review flag if `case_result.manual_review_required = true`.
+**Recommendation block** — the system recommendation (NO_ISSUES / HOLD / DECLINE) displayed prominently, with a manual review flag if `case_result.manual_review_required = true`.
 
 **Report download** — a button that fetches the PDF from DMS using `case_report.pdf_dms_document_id` and streams it to the browser. The button is disabled if `pdf_dms_document_id` is null (report not yet available or upload failed).
 

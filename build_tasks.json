@@ -183,7 +183,7 @@
         {
           "id": "7.2",
           "title": "ReportGenerator",
-          "details": "src/creditunder/pipeline/report_generator.py: orchestrate report generation. Steps: (1) call AIClient.generate_narrative with the case summary, (2) for each source document, fetch via DMSClient and embed as a base64 data URI in the template context (so the PDF is fully self-contained), (3) render the Jinja2 template to HTML and persist to case_report.html_content, (4) convert HTML to PDF via WeasyPrint, (5) upload PDF via DMSClient.upload_document and set case_report.pdf_dms_document_id. On any failure: set case_report.status=FAILED with a populated error_detail (never silently null).",
+          "details": "src/creditunder/pipeline/report_generator.py: orchestrate report generation. Steps: (1) call AIClient.generate_narrative with the case summary, (2) for each source document, fetch via DMSClient and embed as a base64 data URI in the template context (so the PDF is fully self-contained), (3) render the Jinja2 template to HTML and persist to case_report.html_content, (4) convert HTML to PDF via WeasyPrint, (5) upload PDF via DMSClient.upload_document and set case_report.pdf_dms_document_id. On any failure: set case_report.status=FAILED with a populated error_detail (never silently null). Refer to credit_underwriting_system_requirement.md §9 for the report-generation segment of the sequence diagram, §3 for the HTML-first-then-PDF rationale (HTML stored so regen does not re-run the pipeline), and §11 for the failure-handling contract on case_report.",
           "deliverables": [
             "src/creditunder/pipeline/report_generator.py"
           ]
